@@ -42,6 +42,9 @@ type Config struct {
 	// AuthDir is the directory where authentication token files are stored.
 	AuthDir string `yaml:"auth-dir" json:"-"`
 
+	// OIDC defines one or more default configurations for configurable OIDC login flows.
+	OIDC OIDCConfigs `yaml:"oidc" json:"oidc"`
+
 	// Debug enables or disables debug-level logging and other debug features.
 	Debug bool `yaml:"debug" json:"debug"`
 
@@ -181,6 +184,25 @@ type PprofConfig struct {
 	Addr string `yaml:"addr" json:"addr"`
 }
 
+// OIDCConfig holds default values for one configurable OIDC login flow.
+// Command-line flags may override any populated field at runtime.
+type OIDCConfig struct {
+	Name          string                     `yaml:"name" json:"name"`
+	Domain        string                     `yaml:"domain" json:"domain"`
+	AuthorizePath string                     `yaml:"authorize-path" json:"authorize-path"`
+	TokenPath     string                     `yaml:"token-path" json:"token-path"`
+	ClientID      string                     `yaml:"client-id" json:"client-id"`
+	Scope         string                     `yaml:"scope" json:"scope"`
+	CallbackPath  string                     `yaml:"callback-path" json:"callback-path"`
+	RedirectURI   string                     `yaml:"redirect-uri" json:"redirect-uri"`
+	LLMChatURL    string                     `yaml:"llm-chat-url" json:"llm-chat-url"`
+	Headers       map[string]string          `yaml:"headers,omitempty" json:"headers,omitempty"`
+	Models        []OpenAICompatibilityModel `yaml:"models,omitempty" json:"models,omitempty"`
+}
+
+// OIDCConfigs supports either a single mapping or a list of mappings under `oidc:`.
+type OIDCConfigs []OIDCConfig
+
 // RemoteManagement holds management API configuration under 'remote-management'.
 type RemoteManagement struct {
 	// AllowRemote toggles remote (non-localhost) access to management API.
@@ -216,22 +238,6 @@ type RoutingConfig struct {
 	// Strategy selects the credential selection strategy.
 	// Supported values: "round-robin" (default), "fill-first".
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
-
-	// ClaudeCodeSessionAffinity enables session-sticky routing for Claude Code clients.
-	// When enabled, requests with the same session ID (extracted from metadata.user_id)
-	// are routed to the same auth credential when available.
-	// Deprecated: Use SessionAffinity instead for universal session support.
-	ClaudeCodeSessionAffinity bool `yaml:"claude-code-session-affinity,omitempty" json:"claude-code-session-affinity,omitempty"`
-
-	// SessionAffinity enables universal session-sticky routing for all clients.
-	// Session IDs are extracted from multiple sources:
-	// X-Session-ID header, Idempotency-Key, metadata.user_id, conversation_id, or message hash.
-	// Automatic failover is always enabled when bound auth becomes unavailable.
-	SessionAffinity bool `yaml:"session-affinity,omitempty" json:"session-affinity,omitempty"`
-
-	// SessionAffinityTTL specifies how long session-to-auth bindings are retained.
-	// Default: 1h. Accepts duration strings like "30m", "1h", "2h30m".
-	SessionAffinityTTL string `yaml:"session-affinity-ttl,omitempty" json:"session-affinity-ttl,omitempty"`
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.
@@ -595,6 +601,15 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		return &Config{}, nil
 	}
 
+	oidcConfigs, oidcDefined, strippedData, err := extractOIDCConfigs(data)
+	if err != nil {
+		if optional {
+			return &Config{}, nil
+		}
+		return nil, fmt.Errorf("failed to parse oidc config: %w", err)
+	}
+	data = strippedData
+
 	// Unmarshal the YAML data into the Config struct.
 	var cfg Config
 	// Set defaults before unmarshal so that absent keys keep defaults.
@@ -614,6 +629,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 			return &Config{}, nil
 		}
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
+	}
+	if oidcDefined {
+		cfg.OIDC = oidcConfigs
 	}
 
 	// NOTE: Startup legacy key migration is intentionally disabled.
@@ -715,6 +733,75 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Return the populated configuration struct.
 	return &cfg, nil
+}
+
+func extractOIDCConfigs(data []byte) (OIDCConfigs, bool, []byte, error) {
+	if len(bytes.TrimSpace(data)) == 0 {
+		return nil, false, data, nil
+	}
+
+	var root map[string]any
+	if err := yaml.Unmarshal(data, &root); err != nil {
+		// Compatibility: allow the whole file to be a raw OIDC config array/object.
+		configs, oidcErr := parseOIDCConfigs(data)
+		if oidcErr == nil {
+			return configs, true, []byte("{}\n"), nil
+		}
+		return nil, false, data, err
+	}
+	if root == nil {
+		return nil, false, data, nil
+	}
+
+	rawOIDC, ok := root["oidc"]
+	if !ok {
+		return nil, false, data, nil
+	}
+
+	configs, err := parseOIDCConfigs(rawOIDC)
+	if err != nil {
+		return nil, false, data, err
+	}
+
+	delete(root, "oidc")
+	rendered, err := yaml.Marshal(root)
+	if err != nil {
+		return nil, false, data, err
+	}
+	if len(bytes.TrimSpace(rendered)) == 0 {
+		rendered = []byte("{}\n")
+	}
+	return configs, true, rendered, nil
+}
+
+func parseOIDCConfigs(raw any) (OIDCConfigs, error) {
+	var (
+		rendered []byte
+		err      error
+	)
+	switch value := raw.(type) {
+	case []byte:
+		rendered = value
+	case string:
+		rendered = []byte(value)
+	default:
+		rendered, err = yaml.Marshal(raw)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	var multiple []OIDCConfig
+	if err = yaml.Unmarshal(rendered, &multiple); err == nil {
+		return OIDCConfigs(multiple), nil
+	}
+
+	var single OIDCConfig
+	if err = yaml.Unmarshal(rendered, &single); err == nil {
+		return OIDCConfigs{single}, nil
+	}
+
+	return nil, fmt.Errorf("oidc must be an object or array")
 }
 
 // SanitizePayloadRules validates raw JSON payload rule params and drops invalid rules.

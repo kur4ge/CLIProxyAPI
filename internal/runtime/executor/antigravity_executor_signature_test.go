@@ -21,14 +21,6 @@ func testGeminiSignaturePayload() string {
 	return base64.StdEncoding.EncodeToString(payload)
 }
 
-// testFakeClaudeSignature returns a base64 string starting with 'E' that passes
-// the lightweight hasValidClaudeSignature check but has invalid protobuf content
-// (first decoded byte 0x12 is correct, but no valid protobuf field 2 follows),
-// so it fails deep validation in strict mode.
-func testFakeClaudeSignature() string {
-	return base64.StdEncoding.EncodeToString([]byte{0x12, 0xFF, 0xFE, 0xFD})
-}
-
 func testAntigravityAuth(baseURL string) *cliproxyauth.Auth {
 	return &cliproxyauth.Auth{
 		Attributes: map[string]string{
@@ -48,7 +40,7 @@ func invalidClaudeThinkingPayload() []byte {
 			{
 				"role": "assistant",
 				"content": [
-					{"type": "thinking", "thinking": "bad", "signature": "` + testFakeClaudeSignature() + `"},
+					{"type": "thinking", "thinking": "bad", "signature": "` + testGeminiSignaturePayload() + `"},
 					{"type": "text", "text": "hello"}
 				]
 			}

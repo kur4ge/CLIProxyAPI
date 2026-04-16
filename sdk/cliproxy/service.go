@@ -5,6 +5,7 @@ package cliproxy
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -426,6 +427,8 @@ func (s *Service) ensureExecutorsForAuthWithMode(a *coreauth.Auth, forceReplace 
 		s.coreManager.RegisterExecutor(executor.NewIFlowExecutor(s.cfg))
 	case "kimi":
 		s.coreManager.RegisterExecutor(executor.NewKimiExecutor(s.cfg))
+	case "oidc":
+		s.coreManager.RegisterExecutor(executor.NewOIDCExecutor(s.cfg))
 	default:
 		providerKey := strings.ToLower(strings.TrimSpace(a.Provider))
 		if providerKey == "" {
@@ -612,13 +615,9 @@ func (s *Service) Run(ctx context.Context) error {
 	var watcherWrapper *WatcherWrapper
 	reloadCallback := func(newCfg *config.Config) {
 		previousStrategy := ""
-		var previousSessionAffinity bool
-		var previousSessionAffinityTTL string
 		s.cfgMu.RLock()
 		if s.cfg != nil {
 			previousStrategy = strings.ToLower(strings.TrimSpace(s.cfg.Routing.Strategy))
-			previousSessionAffinity = s.cfg.Routing.ClaudeCodeSessionAffinity || s.cfg.Routing.SessionAffinity
-			previousSessionAffinityTTL = s.cfg.Routing.SessionAffinityTTL
 		}
 		s.cfgMu.RUnlock()
 
@@ -642,15 +641,7 @@ func (s *Service) Run(ctx context.Context) error {
 		}
 		previousStrategy = normalizeStrategy(previousStrategy)
 		nextStrategy = normalizeStrategy(nextStrategy)
-
-		nextSessionAffinity := newCfg.Routing.ClaudeCodeSessionAffinity || newCfg.Routing.SessionAffinity
-		nextSessionAffinityTTL := newCfg.Routing.SessionAffinityTTL
-
-		selectorChanged := previousStrategy != nextStrategy ||
-			previousSessionAffinity != nextSessionAffinity ||
-			previousSessionAffinityTTL != nextSessionAffinityTTL
-
-		if s.coreManager != nil && selectorChanged {
+		if s.coreManager != nil && previousStrategy != nextStrategy {
 			var selector coreauth.Selector
 			switch nextStrategy {
 			case "fill-first":
@@ -658,20 +649,6 @@ func (s *Service) Run(ctx context.Context) error {
 			default:
 				selector = &coreauth.RoundRobinSelector{}
 			}
-
-			if nextSessionAffinity {
-				ttl := time.Hour
-				if ttlStr := strings.TrimSpace(nextSessionAffinityTTL); ttlStr != "" {
-					if parsed, err := time.ParseDuration(ttlStr); err == nil && parsed > 0 {
-						ttl = parsed
-					}
-				}
-				selector = coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
-					Fallback: selector,
-					TTL:      ttl,
-				})
-			}
-
 			s.coreManager.SetSelector(selector)
 		}
 
@@ -931,6 +908,9 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 		models = applyExcludedModels(models, excluded)
 	case "kimi":
 		models = registry.GetKimiModels()
+		models = applyExcludedModels(models, excluded)
+	case "oidc":
+		models = s.resolveOIDCModels(a)
 		models = applyExcludedModels(models, excluded)
 	default:
 		// Handle OpenAI-compatibility providers by name using config
@@ -1206,6 +1186,53 @@ func (s *Service) resolveConfigCodexKey(auth *coreauth.Auth) *config.CodexKey {
 	return nil
 }
 
+func (s *Service) resolveConfigOIDC(auth *coreauth.Auth) *config.OIDCConfig {
+	if auth == nil || s.cfg == nil || len(s.cfg.OIDC) == 0 {
+		return nil
+	}
+	var name string
+	if auth.Attributes != nil {
+		name = strings.TrimSpace(auth.Attributes["oidc_name"])
+	}
+	if name == "" && auth.Metadata != nil {
+		if value, ok := auth.Metadata["oidc_name"].(string); ok {
+			name = strings.TrimSpace(value)
+		}
+	}
+	if name != "" {
+		for i := range s.cfg.OIDC {
+			entry := &s.cfg.OIDC[i]
+			if strings.EqualFold(strings.TrimSpace(entry.Name), name) {
+				return entry
+			}
+		}
+	}
+	if len(s.cfg.OIDC) == 1 {
+		return &s.cfg.OIDC[0]
+	}
+	return nil
+}
+
+func (s *Service) resolveOIDCModels(auth *coreauth.Auth) []*ModelInfo {
+	if auth == nil {
+		return nil
+	}
+	if auth.Metadata != nil {
+		if raw, ok := auth.Metadata["models"]; ok && raw != nil {
+			if rendered, err := json.Marshal(raw); err == nil {
+				var models []config.OpenAICompatibilityModel
+				if err = json.Unmarshal(rendered, &models); err == nil && len(models) > 0 {
+					return buildOIDCConfigModels(models)
+				}
+			}
+		}
+	}
+	if entry := s.resolveConfigOIDC(auth); entry != nil && len(entry.Models) > 0 {
+		return buildOIDCConfigModels(entry.Models)
+	}
+	return nil
+}
+
 func (s *Service) oauthExcludedModels(provider, authKind string) []string {
 	cfg := s.cfg
 	if cfg == nil {
@@ -1416,6 +1443,13 @@ func buildCodexConfigModels(entry *config.CodexKey) []*ModelInfo {
 		return nil
 	}
 	return buildConfigModels(entry.Models, "openai", "openai")
+}
+
+func buildOIDCConfigModels(models []config.OpenAICompatibilityModel) []*ModelInfo {
+	if len(models) == 0 {
+		return nil
+	}
+	return buildConfigModels(models, "oidc", "oidc")
 }
 
 func rewriteModelInfoName(name, oldID, newID string) string {

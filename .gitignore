@@ -50,3 +50,6 @@ _bmad-output/*
 # macOS
 .DS_Store
 ._*
+
+# debug
+__debug_**

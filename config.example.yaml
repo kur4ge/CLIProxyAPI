@@ -35,6 +35,35 @@ remote-management:
 # Authentication directory (supports ~ for home directory)
 auth-dir: "~/.cli-proxy-api"
 
+# Default OIDC login configuration.
+# Supports one entry or multiple entries. When multiple entries are configured,
+# use `-oidc-init <name>` to choose one.
+# oidc:
+#   - name: "example-1"
+#     domain: "https://sso.example.com" 
+#     authorize-path: "/oauth2/authorize"
+#     token-path: "/oauth2/token"
+#     client-id: "client-id"
+#     scope: "openid profile email"
+#     callback-path: "/auth/callback"
+#     redirect-uri: "https://www.example.net/auth/callback"
+#     llm-chat-url: "https://llm.example.com/v1/chat/completions"
+#     models:
+#       - name: "gpt-4.1"
+#         alias: "gpt-4.1"
+#   - name: "example-2"
+#     domain: "https://sso.example.com" 
+#     authorize-path: "/oauth2/authorize"
+#     token-path: "/oauth2/token"
+#     client-id: "client-id"
+#     scope: "openid profile email"
+#     callback-path: "/auth/callback"
+#     redirect-uri: "https://www.example.net/auth/callback"
+#     llm-chat-url: "https://llm.example.com/v1/chat/completions"
+#
+# Example:
+# ./server -config ./config.yaml -oidc-init example-1
+
 # API keys for authentication
 api-keys:
   - "your-api-key-1"
@@ -103,13 +132,6 @@ quota-exceeded:
 # Routing strategy for selecting credentials when multiple match.
 routing:
   strategy: "round-robin" # round-robin (default), fill-first
-  # Enable universal session-sticky routing for all clients.
-  # Session IDs are extracted from: X-Session-ID header, Idempotency-Key,
-  # metadata.user_id, conversation_id, or first few messages hash.
-  # Automatic failover is always enabled when bound auth becomes unavailable.
-  session-affinity: false # default: false
-  # How long session-to-auth bindings are retained. Default: 1h
-  session-affinity-ttl: "1h"
 
 # When true, enable authentication for the WebSocket API (/v1/ws).
 ws-auth: false

@@ -23,6 +23,7 @@ import (
 	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/gemini/openai/chat-completions"
 	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/gemini/openai/responses"
 
+	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/openai-responses"
 	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/openai/claude"
 	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/openai/gemini"
 	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/openai/gemini-cli"
