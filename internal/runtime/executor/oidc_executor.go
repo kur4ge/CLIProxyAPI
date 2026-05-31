@@ -24,11 +24,13 @@ import (
 )
 
 type OIDCExecutor struct {
-	cfg *config.Config
+	oidcReasoningSanitize *OIDCReasoningEncryptedContentSanitize
+	cfg                   *config.Config
 }
 
 func NewOIDCExecutor(cfg *config.Config) *OIDCExecutor {
-	return &OIDCExecutor{cfg: cfg}
+	oidcReasoningSanitize := newOIDCReasoningEncryptedContentSanitize()
+	return &OIDCExecutor{oidcReasoningSanitize: oidcReasoningSanitize, cfg: cfg}
 }
 
 func (e *OIDCExecutor) Identifier() string { return "oidc" }
@@ -187,29 +189,59 @@ func (e *OIDCExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	// are captured even when the upstream is an OpenAI-compatible provider.
 	translated, _ = sjson.SetBytes(translated, "stream_options.include_usage", true)
 
-	e.recordRequest(ctx, auth, endpoint, translated)
+	// Sanitize the payload before sending it to the upstream
+	translated = e.oidcReasoningSanitize.PreSanitize(ctx, e.Identifier(), translated)
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(translated))
-	if err != nil {
-		return nil, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Accept", "text/event-stream")
-	httpReq.Header.Set("Cache-Control", "no-cache")
+	var httpResp *http.Response
+	for attempt := 0; ; attempt++ {
+		e.recordRequest(ctx, auth, endpoint, translated)
 
-	httpResp, err := e.HttpRequest(ctx, auth, httpReq)
-	if err != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return nil, err
-	}
-	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		b, _ := io.ReadAll(httpResp.Body)
-		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(translated))
+		if err != nil {
+			return nil, err
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Accept", "text/event-stream")
+		httpReq.Header.Set("Cache-Control", "no-cache")
+
+		httpResp, err = e.HttpRequest(ctx, auth, httpReq)
+		if err != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, err)
+			return nil, err
+		}
+		helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+		if httpResp.StatusCode >= 200 && httpResp.StatusCode < 300 {
+			break
+		}
+
+		data, readErr := io.ReadAll(httpResp.Body)
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("oidc executor: close response body error: %v", errClose)
 		}
-		return nil, statusErr{code: httpResp.StatusCode, msg: string(b)}
+		if readErr != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, readErr)
+			return nil, readErr
+		}
+
+		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
+		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
+		if to == sdktranslator.FormatCodex {
+			err = newCodexStatusErr(httpResp.StatusCode, data)
+		} else {
+			err = statusErr{code: httpResp.StatusCode, msg: string(data)}
+		}
+
+		if attempt > 0 || !strings.Contains(err.Error(), "invalid_encrypted_content") {
+			return nil, err
+		}
+
+		retriedPayload := e.oidcReasoningSanitize.Sanitize(ctx, e.Identifier(), translated)
+		if bytes.Equal(retriedPayload, translated) {
+			return nil, err
+		}
+
+		translated = retriedPayload
+		helps.LogWithRequestID(ctx).Debugf("%s: retrying stream request after dropping invalid reasoning encrypted_content", e.Identifier())
 	}
 
 	out := make(chan cliproxyexecutor.StreamChunk)
