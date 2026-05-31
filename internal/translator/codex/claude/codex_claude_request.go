@@ -331,6 +331,13 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 	template, _ = sjson.SetBytes(template, "store", false)
 	template, _ = sjson.SetBytes(template, "include", []string{"reasoning.encrypted_content"})
 
+	// sync max_output_tokens with max_tokens
+	if maxToken := rootResult.Get("max_tokens"); maxToken.Exists() {
+		template, _ = sjson.SetBytes(template, "max_output_tokens", maxToken.Int())
+	} else {
+		template, _ = sjson.SetBytes(template, "max_output_tokens", 16384)
+	}
+
 	return template
 }
 
