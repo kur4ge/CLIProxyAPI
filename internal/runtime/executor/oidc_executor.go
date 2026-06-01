@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
@@ -82,6 +84,9 @@ func (e *OIDCExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	if endpoint == "" {
 		err = statusErr{code: http.StatusUnauthorized, msg: "missing oidc llm endpoint"}
 		return
+	}
+	if oidcEndpointUsesResponsesAPI(endpoint) {
+		return e.executeResponsesEndpoint(ctx, auth, req, opts, endpoint, baseModel, reporter)
 	}
 
 	from := opts.SourceFormat
@@ -148,6 +153,137 @@ func (e *OIDCExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, body, &param)
 	resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
 	return resp, nil
+}
+
+func (e *OIDCExecutor) executeResponsesEndpoint(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, endpoint string, baseModel string, reporter *helps.UsageReporter) (resp cliproxyexecutor.Response, err error) {
+	from := opts.SourceFormat
+	to := e.oidcRequestFormat(auth)
+	originalPayloadSource := req.Payload
+	if len(opts.OriginalRequest) > 0 {
+		originalPayloadSource = opts.OriginalRequest
+	}
+	originalPayload := originalPayloadSource
+	originalTranslated, translated := translateCodexRequestPair(from, to, baseModel, originalPayload, req.Payload, false)
+
+	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), e.Identifier())
+	if err != nil {
+		return resp, err
+	}
+
+	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
+	requestPath := helps.PayloadRequestPath(opts)
+	translated = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", translated, originalTranslated, requestedModel, requestPath, opts.Headers)
+	translated, _ = sjson.SetBytes(translated, "model", baseModel)
+	translated, _ = sjson.SetBytes(translated, "stream", true)
+	translated, _ = sjson.DeleteBytes(translated, "previous_response_id")
+	translated, _ = sjson.DeleteBytes(translated, "prompt_cache_retention")
+	translated, _ = sjson.DeleteBytes(translated, "safety_identifier")
+	translated, _ = sjson.DeleteBytes(translated, "stream_options")
+	translated = normalizeCodexInstructions(translated)
+	if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
+		translated = ensureImageGenerationTool(translated, baseModel, auth)
+	}
+	translated = e.oidcReasoningSanitize.PreSanitize(ctx, e.Identifier(), translated)
+
+	reporter.SetTranslatedReasoningEffort(translated, to.String())
+
+	e.recordRequest(ctx, auth, endpoint, translated)
+
+	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient = reporter.TrackHTTPClient(httpClient)
+	var httpResp *http.Response
+	for attempt := 0; ; attempt++ {
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(translated))
+		if err != nil {
+			return resp, err
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		if err = e.PrepareRequest(httpReq, auth); err != nil {
+			return resp, err
+		}
+
+		httpResp, err = httpClient.Do(httpReq)
+		if err != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, err)
+			return resp, err
+		}
+
+		helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+		if httpResp.StatusCode >= 200 && httpResp.StatusCode < 300 {
+			break
+		}
+
+		data, readErr := io.ReadAll(httpResp.Body)
+		if errClose := httpResp.Body.Close(); errClose != nil {
+			log.Errorf("oidc executor: close response body error: %v", errClose)
+		}
+		if readErr != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, readErr)
+			return resp, readErr
+		}
+
+		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
+		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
+		err = newCodexStatusErr(httpResp.StatusCode, data)
+		if attempt > 0 || !strings.Contains(err.Error(), "invalid_encrypted_content") {
+			return resp, err
+		}
+
+		retriedPayload := e.oidcReasoningSanitize.Sanitize(ctx, e.Identifier(), translated)
+		if bytes.Equal(retriedPayload, translated) {
+			return resp, err
+		}
+
+		translated = retriedPayload
+		helps.LogWithRequestID(ctx).Debugf("%s: retrying responses request after dropping invalid reasoning encrypted_content", e.Identifier())
+	}
+	defer func() {
+		if errClose := httpResp.Body.Close(); errClose != nil {
+			log.Errorf("oidc executor: close response body error: %v", errClose)
+		}
+	}()
+
+	data, err := io.ReadAll(httpResp.Body)
+	if err != nil {
+		helps.RecordAPIResponseError(ctx, e.cfg, err)
+		return resp, err
+	}
+	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
+
+	outputItemsByIndex := make(map[int64][]byte)
+	var outputItemsFallback [][]byte
+	for _, line := range bytes.Split(data, []byte("\n")) {
+		if !bytes.HasPrefix(line, dataTag) {
+			continue
+		}
+
+		eventData := bytes.TrimSpace(line[len(dataTag):])
+		eventType := gjson.GetBytes(eventData, "type").String()
+
+		if streamErr, ok := codexTerminalStreamContextLengthErr(eventData); ok {
+			return resp, streamErr
+		}
+
+		switch eventType {
+		case "response.output_item.done":
+			collectCodexOutputItemDone(eventData, outputItemsByIndex, &outputItemsFallback)
+		case "response.completed":
+			if detail, ok := helps.ParseCodexUsage(eventData); ok {
+				reporter.Publish(ctx, detail)
+			}
+			publishCodexImageToolUsage(ctx, reporter, translated, eventData)
+			reporter.EnsurePublished(ctx)
+
+			completedData := patchCodexCompletedOutput(eventData, outputItemsByIndex, outputItemsFallback)
+			var param any
+			out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalPayload, translated, completedData, &param)
+			resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
+			return resp, nil
+		}
+	}
+
+	err = statusErr{code: http.StatusRequestTimeout, msg: "stream error: stream disconnected before completion: stream closed before response.completed"}
+	return resp, err
 }
 
 func (e *OIDCExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
@@ -512,4 +648,16 @@ func metadataValueAsString(value any) string {
 	default:
 		return ""
 	}
+}
+
+func oidcEndpointUsesResponsesAPI(endpoint string) bool {
+	trimmed := strings.TrimSpace(endpoint)
+	if trimmed == "" {
+		return false
+	}
+	parsed, err := url.Parse(trimmed)
+	if err == nil && parsed.Path != "" {
+		return strings.HasSuffix(strings.TrimSuffix(parsed.Path, "/"), "/responses")
+	}
+	return strings.HasSuffix(strings.TrimSuffix(trimmed, "/"), "/responses")
 }
