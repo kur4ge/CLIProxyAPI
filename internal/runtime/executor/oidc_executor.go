@@ -19,6 +19,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -47,12 +48,65 @@ func (e *OIDCExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth
 	req.Header.Set("User-Agent", "cli-proxy-oidc")
 
 	headers := e.oidcHeaders(auth)
+	seed := oidcSessionSeedFromContext(req.Context())
 	if headers != nil {
 		for k, v := range headers {
-			req.Header.Set(k, v)
+			req.Header.Set(k, helps.RenderHeaderValue(v, seed))
+		}
+	}
+	if oidcFirstRequestFromContext(req.Context()) {
+		for k, v := range e.oidcFirstRequestHeaders(auth) {
+			if strings.TrimSpace(v) == "" {
+				req.Header.Del(k)
+				continue
+			}
+			req.Header.Set(k, helps.RenderHeaderValue(v, seed))
 		}
 	}
 	return nil
+}
+
+type oidcSessionSeedContextKey struct{}
+
+type oidcFirstRequestContextKey struct{}
+
+// withOIDCSessionSeed stores the downstream session id used as a deterministic
+// seed for ${random:...} header variables.
+func withOIDCSessionSeed(ctx context.Context, seed string) context.Context {
+	if ctx == nil || strings.TrimSpace(seed) == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, oidcSessionSeedContextKey{}, seed)
+}
+
+func oidcSessionSeedFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	if seed, ok := ctx.Value(oidcSessionSeedContextKey{}).(string); ok {
+		return seed
+	}
+	return ""
+}
+
+// withOIDCFirstRequest records whether the current execution is the first
+// request of its session, so PrepareRequest (which may be retried) consistently
+// applies first-request-headers.
+func withOIDCFirstRequest(ctx context.Context, first bool) context.Context {
+	if ctx == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, oidcFirstRequestContextKey{}, first)
+}
+
+func oidcFirstRequestFromContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	if first, ok := ctx.Value(oidcFirstRequestContextKey{}).(bool); ok {
+		return first
+	}
+	return false
 }
 
 func (e *OIDCExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth, req *http.Request) (*http.Response, error) {
@@ -74,6 +128,10 @@ func (e *OIDCExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	if opts.Alt == "responses/compact" {
 		return resp, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
 	}
+
+	seedID := cliproxyauth.ExtractSessionID(opts.Headers, opts.OriginalRequest, opts.Metadata)
+	ctx = withOIDCSessionSeed(ctx, seedID)
+	ctx = withOIDCFirstRequest(ctx, helps.MarkSessionSeen(seedID))
 
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
@@ -143,13 +201,15 @@ func (e *OIDCExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		return resp, err
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, body)
-	reporter.Publish(ctx, helps.ParseOpenAIUsage(body))
+	to = e.oidcResponseFormat(auth)
+	usageDetail := parseOIDCUsage(to, body)
+	reporter.Publish(ctx, usageDetail)
+	helps.AddSessionTokens(oidcSessionSeedFromContext(ctx), usageDetail.InputTokens, usageDetail.OutputTokens)
 	// Ensure we at least record the request even if upstream doesn't return usage
 	reporter.EnsurePublished(ctx)
 	// Translate response back to source format when needed
 
 	var param any
-	to = e.oidcResponseFormat(auth)
 	out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, body, &param)
 	resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
 	return resp, nil
@@ -270,6 +330,7 @@ func (e *OIDCExecutor) executeResponsesEndpoint(ctx context.Context, auth *clipr
 		case "response.completed":
 			if detail, ok := helps.ParseCodexUsage(eventData); ok {
 				reporter.Publish(ctx, detail)
+				helps.AddSessionTokens(oidcSessionSeedFromContext(ctx), detail.InputTokens, detail.OutputTokens)
 			}
 			publishCodexImageToolUsage(ctx, reporter, translated, eventData)
 			reporter.EnsurePublished(ctx)
@@ -290,6 +351,10 @@ func (e *OIDCExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	if opts.Alt == "responses/compact" {
 		return nil, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
 	}
+
+	seedID := cliproxyauth.ExtractSessionID(opts.Headers, opts.OriginalRequest, opts.Metadata)
+	ctx = withOIDCSessionSeed(ctx, seedID)
+	ctx = withOIDCFirstRequest(ctx, helps.MarkSessionSeen(seedID))
 
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
@@ -391,12 +456,16 @@ func (e *OIDCExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		scanner := bufio.NewScanner(httpResp.Body)
 		scanner.Buffer(nil, 52_428_800)
 		var param any
+		var lastUsage usage.Detail
+		var sawUsage bool
 		to = e.oidcResponseFormat(auth)
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
-			if detail, ok := helps.ParseOpenAIStreamUsage(line); ok {
+			if detail, ok := parseOIDCStreamUsage(to, line); ok {
 				reporter.Publish(ctx, detail)
+				lastUsage = detail
+				sawUsage = true
 			}
 			trimmedLine := bytes.TrimSpace(line)
 			if len(trimmedLine) == 0 {
@@ -453,6 +522,9 @@ func (e *OIDCExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		}
 		// Ensure we record the request if no usage chunk was ever seen
 		reporter.EnsurePublished(ctx)
+		if sawUsage {
+			helps.AddSessionTokens(oidcSessionSeedFromContext(ctx), lastUsage.InputTokens, lastUsage.OutputTokens)
+		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
 }
@@ -575,6 +647,17 @@ func (e *OIDCExecutor) oidcHeaders(auth *cliproxyauth.Auth) map[string]string {
 	return config.Headers
 }
 
+func (e *OIDCExecutor) oidcFirstRequestHeaders(auth *cliproxyauth.Auth) map[string]string {
+	if auth == nil {
+		return nil
+	}
+	config, err := oidc.SelectOIDCConfig(e.cfg, metadataNestedStringValue(auth.Metadata, "oidc_name"))
+	if err != nil {
+		return nil
+	}
+	return config.FirstRequestHeaders
+}
+
 func (e *OIDCExecutor) oidcRequestFormat(auth *cliproxyauth.Auth) sdktranslator.Format {
 	if auth == nil {
 		return ""
@@ -595,6 +678,49 @@ func (e *OIDCExecutor) oidcResponseFormat(auth *cliproxyauth.Auth) sdktranslator
 		return ""
 	}
 	return sdktranslator.Format(config.ResponseFormat)
+}
+
+// parseOIDCStreamUsage extracts usage from a single SSE line according to the
+// configured upstream response format. Falls back to OpenAI-style parsing for
+// unknown formats.
+func parseOIDCStreamUsage(format sdktranslator.Format, line []byte) (usage.Detail, bool) {
+	switch format {
+	case sdktranslator.FormatCodex:
+		return helps.ParseCodexStreamUsage(line)
+	case sdktranslator.FormatClaude:
+		return helps.ParseClaudeStreamUsage(line)
+	case sdktranslator.FormatGemini:
+		return helps.ParseGeminiStreamUsage(line)
+	case sdktranslator.FormatGeminiCLI:
+		return helps.ParseGeminiCLIStreamUsage(line)
+	case sdktranslator.FormatAntigravity:
+		return helps.ParseAntigravityStreamUsage(line)
+	default:
+		return helps.ParseOpenAIStreamUsage(line)
+	}
+}
+
+// parseOIDCUsage extracts usage from a non-stream response body according to the
+// configured upstream response format. Falls back to OpenAI-style parsing for
+// unknown formats.
+func parseOIDCUsage(format sdktranslator.Format, body []byte) usage.Detail {
+	switch format {
+	case sdktranslator.FormatCodex:
+		if detail, ok := helps.ParseCodexUsage(body); ok {
+			return detail
+		}
+		return usage.Detail{}
+	case sdktranslator.FormatClaude:
+		return helps.ParseClaudeUsage(body)
+	case sdktranslator.FormatGemini:
+		return helps.ParseGeminiUsage(body)
+	case sdktranslator.FormatGeminiCLI:
+		return helps.ParseGeminiCLIUsage(body)
+	case sdktranslator.FormatAntigravity:
+		return helps.ParseAntigravityUsage(body)
+	default:
+		return helps.ParseOpenAIUsage(body)
+	}
 }
 
 func metadataStringMap(metadata map[string]any) map[string]string {

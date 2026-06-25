@@ -429,6 +429,18 @@ func resolveUsageAuthType(auth *cliproxyauth.Auth) string {
 	return kind
 }
 
+func ParseCodexStreamUsage(line []byte) (usage.Detail, bool) {
+	payload := jsonPayload(line)
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return usage.Detail{}, false
+	}
+	usageNode := gjson.ParseBytes(payload).Get("response.usage")
+	if !hasOpenAIStyleUsageTokenFields(usageNode) {
+		return usage.Detail{}, false
+	}
+	return parseOpenAIStyleUsageNode(usageNode), true
+}
+
 func ParseCodexUsage(data []byte) (usage.Detail, bool) {
 	usageNode := gjson.ParseBytes(data).Get("response.usage")
 	if !hasOpenAIStyleUsageTokenFields(usageNode) {

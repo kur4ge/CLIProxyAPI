@@ -50,7 +50,11 @@ type OIDCConfig struct {
 	RequestFormat  string            `yaml:"request-format" json:"request-format"`
 	ResponseFormat string            `yaml:"response-format" json:"response-format"`
 	Headers        map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
-	Models         []OIDCModel       `yaml:"models,omitempty" json:"models,omitempty"`
+	// FirstRequestHeaders are applied only on the first request of a session
+	// (i.e. when the session cache is not yet populated). They override or add
+	// to Headers; an empty value removes the header from the request.
+	FirstRequestHeaders map[string]string `yaml:"first-request-headers,omitempty" json:"first-request-headers,omitempty"`
+	Models              []OIDCModel       `yaml:"models,omitempty" json:"models,omitempty"`
 }
 
 // OIDCConfigs supports either a single mapping or a list of mappings under `oidc:`.
