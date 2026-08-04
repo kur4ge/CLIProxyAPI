@@ -193,12 +193,6 @@ func (m *Manager) selectionModelForAuth(auth *Auth, routeModel string) string {
 	if strings.TrimSpace(resolvedModel) == "" {
 		resolvedModel = requestedModel
 	}
-	// OIDC aliases (including regex ones) are resolved via the API-key alias path.
-	if strings.EqualFold(strings.TrimSpace(auth.Provider), "oidc") {
-		if oidcResolved := m.applyAPIKeyModelAlias(auth, resolvedModel); strings.TrimSpace(oidcResolved) != "" {
-			resolvedModel = oidcResolved
-		}
-	}
 	return resolvedModel
 }
 

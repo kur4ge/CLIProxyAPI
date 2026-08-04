@@ -196,16 +196,6 @@ func (h *BaseAPIHandler) getRequestDetailsWithOptions(modelName string, allowIma
 		providers = util.GetProviderName(resolvedModelName)
 	}
 
-	// Fallback for OIDC regex aliases: such aliases cannot be enumerated as
-	// concrete models in the registry, so the model may be unknown here even
-	// though an OIDC auth can serve it. Route to the OIDC provider in that case.
-	if len(providers) == 0 && h != nil && h.AuthManager != nil {
-		if h.AuthManager.ModelHasOIDCProvider(baseModel) ||
-			(baseModel != resolvedModelName && h.AuthManager.ModelHasOIDCProvider(resolvedModelName)) {
-			providers = []string{"oidc"}
-		}
-	}
-
 	if len(providers) == 0 {
 		return nil, "", &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("unknown provider for model %s", modelName)}
 	}

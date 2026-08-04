@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -563,19 +562,7 @@ func (m *Manager) authSupportsRouteModel(registryRef *registry.ModelRegistry, au
 		return true
 	}
 	selectionKey := m.selectionModelKeyForAuth(auth, routeModel)
-	if selectionKey != "" && selectionKey != routeKey && registryRef.ClientSupportsModel(auth.ID, selectionKey) {
-		return true
-	}
-	// OIDC regex aliases cannot be enumerated as concrete registered models, so
-	// fall back to alias resolution: if the requested model resolves to a
-	// non-empty upstream model, treat this auth as supporting it.
-	if strings.EqualFold(strings.TrimSpace(auth.Provider), "oidc") {
-		cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
-		if resolved := resolveUpstreamModelForOIDC(cfg, auth, routeModel); strings.TrimSpace(resolved) != "" {
-			return true
-		}
-	}
-	return false
+	return selectionKey != "" && selectionKey != routeKey && registryRef.ClientSupportsModel(auth.ID, selectionKey)
 }
 
 func (m *Manager) normalizeProviders(providers []string) []string {
