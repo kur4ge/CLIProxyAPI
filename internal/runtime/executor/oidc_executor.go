@@ -49,11 +49,11 @@ func (e *OIDCExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth
 
 	headers := e.oidcHeaders(auth)
 	seed := oidcSessionSeedFromContext(req.Context())
-	if headers != nil {
-		for k, v := range headers {
-			req.Header.Set(k, helps.RenderHeaderValue(v, seed))
-		}
+
+	for k, v := range headers {
+		req.Header.Set(k, helps.RenderHeaderValue(v, seed))
 	}
+
 	if oidcFirstRequestFromContext(req.Context()) {
 		for k, v := range e.oidcFirstRequestHeaders(auth) {
 			if strings.TrimSpace(v) == "" {

@@ -43,7 +43,11 @@ func (s *OIDCReasoningEncryptedContentSanitize) PreSanitize(ctx context.Context,
 	provider = strings.TrimSpace(provider)
 
 	updated := body
-	for index, item := range input.Array() {
+	// Iterate in reverse so deleting array elements does not shift the
+	// indices of items we have not yet processed.
+	items := input.Array()
+	for index := len(items) - 1; index >= 0; index-- {
+		item := items[index]
 		if strings.TrimSpace(item.Get("type").String()) != "reasoning" {
 			continue
 		}
@@ -62,18 +66,20 @@ func (s *OIDCReasoningEncryptedContentSanitize) PreSanitize(ctx context.Context,
 			continue
 		}
 
-		next, err := sjson.DeleteBytes(updated, encryptedContentPath)
-		if err != nil {
-			helps.LogWithRequestID(ctx).Debugf("%s: failed to pre-drop cached reasoning encrypted_content at input[%d]: %v", provider, index, err)
-			continue
-		}
-		updated = next
-
 		itemID := strings.TrimSpace(gjson.GetBytes(updated, fmt.Sprintf("input.%d.id", index)).String())
 		if itemID == "" {
 			itemID = fmt.Sprintf("input[%d]", index)
 		}
-		helps.LogWithRequestID(ctx).Debugf("%s: pre-dropped cached reasoning encrypted_content at input[%d] item_id=%q", provider, index, itemID)
+
+		itemPath := fmt.Sprintf("input.%d", index)
+		next, err := sjson.DeleteBytes(updated, itemPath)
+		if err != nil {
+			helps.LogWithRequestID(ctx).Debugf("%s: failed to pre-drop cached reasoning item at input[%d]: %v", provider, index, err)
+			continue
+		}
+		updated = next
+
+		helps.LogWithRequestID(ctx).Debugf("%s: pre-dropped cached reasoning item at input[%d] item_id=%q", provider, index, itemID)
 	}
 	return updated
 }
@@ -89,7 +95,11 @@ func (s *OIDCReasoningEncryptedContentSanitize) Sanitize(ctx context.Context, pr
 	provider = strings.TrimSpace(provider)
 
 	updated := body
-	for index, item := range input.Array() {
+	// Iterate in reverse so deleting array elements does not shift the
+	// indices of items we have not yet processed.
+	items := input.Array()
+	for index := len(items) - 1; index >= 0; index-- {
+		item := items[index]
 		if strings.TrimSpace(item.Get("type").String()) != "reasoning" {
 			continue
 		}
@@ -104,19 +114,22 @@ func (s *OIDCReasoningEncryptedContentSanitize) Sanitize(ctx context.Context, pr
 		if err != nil {
 			continue
 		}
-		next, err := sjson.DeleteBytes(updated, encryptedContentPath)
-		if err != nil {
-			helps.LogWithRequestID(ctx).Debugf("%s: failed to drop invalid reasoning encrypted_content at input[%d]: %v", provider, index, err)
-			continue
-		}
-		updated = next
-		s.rememberHash(hash)
 
 		itemID := strings.TrimSpace(gjson.GetBytes(updated, fmt.Sprintf("input.%d.id", index)).String())
 		if itemID == "" {
 			itemID = fmt.Sprintf("input[%d]", index)
 		}
-		helps.LogWithRequestID(ctx).Debugf("%s: dropped invalid reasoning encrypted_content at input[%d] item_id=%q", provider, index, itemID)
+
+		itemPath := fmt.Sprintf("input.%d", index)
+		next, err := sjson.DeleteBytes(updated, itemPath)
+		if err != nil {
+			helps.LogWithRequestID(ctx).Debugf("%s: failed to drop invalid reasoning item at input[%d]: %v", provider, index, err)
+			continue
+		}
+		updated = next
+		s.rememberHash(hash)
+
+		helps.LogWithRequestID(ctx).Debugf("%s: dropped invalid reasoning item at input[%d] item_id=%q", provider, index, itemID)
 	}
 	return updated
 }
