@@ -160,6 +160,8 @@ func (e *OIDCExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	if err != nil {
 		return resp, err
 	}
+	// Ensure the upstream model matches the resolved (alias-mapped) model name.
+	translated, _ = sjson.SetBytes(translated, "model", baseModel)
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
@@ -381,6 +383,8 @@ func (e *OIDCExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	if err != nil {
 		return nil, err
 	}
+	// Ensure the upstream model matches the resolved (alias-mapped) model name.
+	translated, _ = sjson.SetBytes(translated, "model", baseModel)
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)

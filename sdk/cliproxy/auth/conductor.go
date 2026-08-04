@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -580,6 +581,12 @@ func (m *Manager) selectionModelForAuth(auth *Auth, routeModel string) string {
 	if strings.TrimSpace(resolvedModel) == "" {
 		resolvedModel = requestedModel
 	}
+	// OIDC aliases (including regex ones) are resolved via the API-key alias path.
+	if strings.EqualFold(strings.TrimSpace(auth.Provider), "oidc") {
+		if oidcResolved := m.applyAPIKeyModelAlias(auth, resolvedModel); strings.TrimSpace(oidcResolved) != "" {
+			resolvedModel = oidcResolved
+		}
+	}
 	return resolvedModel
 }
 
@@ -718,7 +725,19 @@ func (m *Manager) authSupportsRouteModel(registryRef *registry.ModelRegistry, au
 		return true
 	}
 	selectionKey := m.selectionModelKeyForAuth(auth, routeModel)
-	return selectionKey != "" && selectionKey != routeKey && registryRef.ClientSupportsModel(auth.ID, selectionKey)
+	if selectionKey != "" && selectionKey != routeKey && registryRef.ClientSupportsModel(auth.ID, selectionKey) {
+		return true
+	}
+	// OIDC regex aliases cannot be enumerated as concrete registered models, so
+	// fall back to alias resolution: if the requested model resolves to a
+	// non-empty upstream model, treat this auth as supporting it.
+	if strings.EqualFold(strings.TrimSpace(auth.Provider), "oidc") {
+		cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+		if resolved := resolveUpstreamModelForOIDC(cfg, auth, routeModel); strings.TrimSpace(resolved) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func discardStreamChunks(ch <-chan cliproxyexecutor.StreamChunk) {
@@ -1902,7 +1921,8 @@ func (m *Manager) applyAPIKeyModelAlias(auth *Auth, requestedModel string) strin
 	}
 
 	kind, _ := auth.AccountInfo()
-	if !strings.EqualFold(strings.TrimSpace(kind), "api_key") {
+	isOIDC := strings.EqualFold(strings.TrimSpace(auth.Provider), "oidc")
+	if !strings.EqualFold(strings.TrimSpace(kind), "api_key") && !strings.EqualFold(strings.TrimSpace(kind), "oidc") && !isOIDC {
 		return requestedModel
 	}
 
@@ -1934,6 +1954,8 @@ func (m *Manager) applyAPIKeyModelAlias(auth *Auth, requestedModel string) strin
 		upstreamModel = resolveUpstreamModelForCodexAPIKey(cfg, auth, requestedModel)
 	case "vertex":
 		upstreamModel = resolveUpstreamModelForVertexAPIKey(cfg, auth, requestedModel)
+	case "oidc":
+		upstreamModel = resolveUpstreamModelForOIDC(cfg, auth, requestedModel)
 	default:
 		upstreamModel = resolveUpstreamModelForOpenAICompatAPIKey(cfg, auth, requestedModel)
 	}
@@ -2048,6 +2070,115 @@ func resolveUpstreamModelForVertexAPIKey(cfg *internalconfig.Config, auth *Auth,
 		return ""
 	}
 	return resolveModelAliasFromConfigModels(requestedModel, asModelAliasEntries(entry.Models))
+}
+
+// ModelHasOIDCProvider reports whether the requested model can be served by any
+// OIDC auth, either through an exact alias or a regex alias. This is used by the
+// request router as a fallback when the model is not present in the global model
+// registry (regex aliases cannot be enumerated as concrete models).
+func (m *Manager) ModelHasOIDCProvider(model string) bool {
+	if m == nil || strings.TrimSpace(model) == "" {
+		return false
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	for _, auth := range m.snapshotAuths() {
+		if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "oidc") {
+			continue
+		}
+		if resolved := resolveUpstreamModelForOIDC(cfg, auth, model); strings.TrimSpace(resolved) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveUpstreamModelForOIDC resolves the requested (client-visible) model to the
+// upstream model name using the OIDC auth's configured model alias table.
+//
+// Matching order:
+//  1. Exact alias match (case-insensitive), reusing the shared resolver.
+//  2. Regex alias match: when an alias starts with "^" and ends with "$", it is
+//     treated as a regular expression matched against the requested base model.
+//     The corresponding name acts as a replacement template supporting $1/$2
+//     backreferences. Regex entries are tried in configuration order.
+//
+// The thinking suffix on the requested model is preserved on the resolved model.
+func resolveUpstreamModelForOIDC(cfg *internalconfig.Config, auth *Auth, requestedModel string) string {
+	models := oidcModelsForAuth(cfg, auth)
+	if len(models) == 0 {
+		return ""
+	}
+	// Exact match takes priority.
+	if resolved := resolveModelAliasFromConfigModels(requestedModel, asModelAliasEntries(models)); resolved != "" {
+		return resolved
+	}
+	// Fallback: regex alias match with backreference substitution.
+	return resolveOIDCRegexModelAlias(requestedModel, models)
+}
+
+// resolveOIDCRegexModelAlias matches the requested model against regex aliases
+// (aliases wrapped with "^" and "$") and returns the substituted upstream name.
+func resolveOIDCRegexModelAlias(requestedModel string, models []internalconfig.OIDCModel) string {
+	requestResult := thinking.ParseSuffix(requestedModel)
+	base := requestResult.ModelName
+	if base == "" {
+		base = strings.TrimSpace(requestedModel)
+	}
+	if base == "" {
+		return ""
+	}
+	for i := range models {
+		alias := strings.TrimSpace(models[i].Alias)
+		name := strings.TrimSpace(models[i].Name)
+		if alias == "" || name == "" {
+			continue
+		}
+		if !strings.HasPrefix(alias, "^") || !strings.HasSuffix(alias, "$") {
+			continue
+		}
+		re, err := regexp.Compile(alias)
+		if err != nil {
+			continue
+		}
+		if !re.MatchString(base) {
+			continue
+		}
+		resolved := strings.TrimSpace(re.ReplaceAllString(base, name))
+		if resolved == "" {
+			continue
+		}
+		return preserveResolvedModelSuffix(resolved, requestResult)
+	}
+	return ""
+}
+
+// oidcModelsForAuth returns the OIDC model alias entries for the given auth,
+// preferring the models embedded in the auth metadata and falling back to the
+// matching OIDC configuration selected by the auth's oidc_name.
+func oidcModelsForAuth(cfg *internalconfig.Config, auth *Auth) []internalconfig.OIDCModel {
+	if auth == nil {
+		return nil
+	}
+	if auth.Metadata != nil {
+		if raw, ok := auth.Metadata["models"]; ok && raw != nil {
+			if rendered, err := json.Marshal(raw); err == nil {
+				var models []internalconfig.OIDCModel
+				if err = json.Unmarshal(rendered, &models); err == nil && len(models) > 0 {
+					return models
+				}
+			}
+		}
+		if cfg != nil {
+			if name, ok := auth.Metadata["oidc_name"].(string); ok && strings.TrimSpace(name) != "" {
+				for i := range cfg.OIDC {
+					if strings.EqualFold(strings.TrimSpace(cfg.OIDC[i].Name), strings.TrimSpace(name)) {
+						return cfg.OIDC[i].Models
+					}
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func resolveUpstreamModelForOpenAICompatAPIKey(cfg *internalconfig.Config, auth *Auth, requestedModel string) string {
