@@ -243,7 +243,7 @@ func (e *OIDCExecutor) executeResponsesEndpoint(ctx context.Context, auth *clipr
 	translated, _ = sjson.DeleteBytes(translated, "stream_options")
 	translated = normalizeCodexInstructions(translated)
 	if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
-		translated = ensureImageGenerationTool(translated, baseModel, auth)
+		translated = ensureImageGenerationTool(translated, baseModel, auth, opts.Headers)
 	}
 	translated = e.oidcReasoningSanitize.PreSanitize(ctx, e.Identifier(), translated)
 
@@ -695,8 +695,6 @@ func parseOIDCStreamUsage(format sdktranslator.Format, line []byte) (usage.Detai
 		return helps.ParseClaudeStreamUsage(line)
 	case sdktranslator.FormatGemini:
 		return helps.ParseGeminiStreamUsage(line)
-	case sdktranslator.FormatGeminiCLI:
-		return helps.ParseGeminiCLIStreamUsage(line)
 	case sdktranslator.FormatAntigravity:
 		return helps.ParseAntigravityStreamUsage(line)
 	default:
@@ -718,8 +716,6 @@ func parseOIDCUsage(format sdktranslator.Format, body []byte) usage.Detail {
 		return helps.ParseClaudeUsage(body)
 	case sdktranslator.FormatGemini:
 		return helps.ParseGeminiUsage(body)
-	case sdktranslator.FormatGeminiCLI:
-		return helps.ParseGeminiCLIUsage(body)
 	case sdktranslator.FormatAntigravity:
 		return helps.ParseAntigravityUsage(body)
 	default:

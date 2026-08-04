@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -181,7 +182,7 @@ func oidcReasoningEncryptedContentHash(encryptedContent gjson.Result) (string, e
 		rawSignature := encryptedContent.String()
 		if rawSignature != strings.TrimSpace(rawSignature) {
 			errMsg := "encrypted_content has leading or trailing whitespace"
-			return "", fmt.Errorf(errMsg)
+			return "", errors.New(errMsg)
 		} else if _, err := signature.InspectGPTReasoningSignature(rawSignature); err != nil {
 			return "", err
 		}

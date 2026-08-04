@@ -22,9 +22,17 @@ type OIDCModel struct {
 	// Alias is the model name alias that clients will use to reference this model.
 	Alias string `yaml:"alias" json:"alias"`
 
+	// DisplayName is the human-friendly name advertised to clients. When empty the
+	// alias (or name) is used.
+	DisplayName string `yaml:"display-name,omitempty" json:"display-name,omitempty"`
+
 	// Thinking configures the thinking/reasoning capability for this model.
 	// If nil, the model defaults to level-based reasoning with levels ["low", "medium", "high"].
 	Thinking *registry.ThinkingSupport `yaml:"thinking,omitempty" json:"thinking,omitempty"`
+
+	// ForceMapping forces the alias to be mapped to the upstream model name even
+	// when the requested model already matches a registered model.
+	ForceMapping bool `yaml:"force-mapping,omitempty" json:"force-mapping,omitempty"`
 }
 
 func (m OIDCModel) GetName() string {
@@ -33,6 +41,18 @@ func (m OIDCModel) GetName() string {
 
 func (m OIDCModel) GetAlias() string {
 	return m.Alias
+}
+
+func (m OIDCModel) GetDisplayName() string {
+	return m.DisplayName
+}
+
+func (m OIDCModel) GetThinking() *registry.ThinkingSupport {
+	return m.Thinking
+}
+
+func (m OIDCModel) GetForceMapping() bool {
+	return m.ForceMapping
 }
 
 // Command-line flags may override any populated field at runtime.
