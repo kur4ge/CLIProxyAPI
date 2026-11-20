@@ -337,7 +337,7 @@ func (e *OIDCExecutor) executeResponsesEndpoint(ctx context.Context, auth *clipr
 		switch eventType {
 		case "response.output_item.done":
 			collectCodexOutputItemDone(eventData, outputItemsByIndex, &outputItemsFallback)
-		case "response.completed":
+		case "response.completed", "response.incomplete":
 			if detail, ok := helps.ParseCodexUsage(eventData); ok {
 				reporter.Publish(ctx, detail)
 				helps.AddSessionTokens(oidcSessionSeedFromContext(ctx), detail.InputTokens, detail.OutputTokens)
@@ -345,9 +345,9 @@ func (e *OIDCExecutor) executeResponsesEndpoint(ctx context.Context, auth *clipr
 			publishCodexImageToolUsage(ctx, reporter, translated, eventData)
 			reporter.EnsurePublished(ctx)
 
-			completedData := patchCodexCompletedOutput(eventData, outputItemsByIndex, outputItemsFallback)
+			terminalData := patchCodexCompletedOutput(eventData, outputItemsByIndex, outputItemsFallback)
 			var param any
-			out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalPayload, translated, completedData, &param)
+			out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalPayload, translated, terminalData, &param)
 			resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
 			return resp, nil
 		}

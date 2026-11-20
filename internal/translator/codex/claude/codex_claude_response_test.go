@@ -1169,6 +1169,13 @@ func TestConvertCodexResponseToClaude_StreamStopReasonMapping(t *testing.T) {
 			wantReason: "max_tokens",
 		},
 		{
+			name: "Incomplete length maps to max_tokens",
+			chunks: [][]byte{
+				[]byte("data: {\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"length\"},\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}"),
+			},
+			wantReason: "max_tokens",
+		},
+		{
 			name: "Tool call wins over stop",
 			chunks: [][]byte{
 				[]byte("data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"lookup\"}}"),
@@ -1374,6 +1381,20 @@ func TestConvertCodexResponseToClaudeNonStream_StopReasonMapping(t *testing.T) {
 					"id":"resp_1",
 					"model":"gpt-5",
 					"incomplete_details":{"reason":"max_output_tokens"},
+					"usage":{"input_tokens":1,"output_tokens":1},
+					"output":[]
+				}
+			}`),
+			wantReason: "max_tokens",
+		},
+		{
+			name: "Incomplete length maps to max_tokens",
+			response: []byte(`{
+				"type":"response.incomplete",
+				"response":{
+					"id":"resp_1",
+					"model":"gpt-5",
+					"incomplete_details":{"reason":"length"},
 					"usage":{"input_tokens":1,"output_tokens":1},
 					"output":[]
 				}

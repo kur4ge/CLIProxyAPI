@@ -581,7 +581,7 @@ func mapCodexStopReasonToClaude(stopReason string, hasToolCall bool) string {
 	switch stopReason {
 	case "", "stop", "completed":
 		return "end_turn"
-	case "max_tokens", "max_output_tokens":
+	case "max_tokens", "max_output_tokens", "length":
 		return "max_tokens"
 	case "tool_use", "tool_calls", "function_call":
 		return "end_turn"
