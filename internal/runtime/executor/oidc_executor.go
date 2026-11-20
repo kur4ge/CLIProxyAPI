@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/MoeForge/moego/json"
+	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/oidc"
 	oidcauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/oidc"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
@@ -22,8 +23,6 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 type OIDCExecutor struct {
@@ -161,16 +160,13 @@ func (e *OIDCExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		return resp, err
 	}
 	// Ensure the upstream model matches the resolved (alias-mapped) model name.
-	translated, _ = sjson.SetBytes(translated, "model", baseModel)
+	doc := ojson.NewDoc(translated)
+	_ = doc.Set("model", baseModel)
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
-	translated = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", translated, originalTranslated, requestedModel, requestPath)
-	if opts.Alt == "responses/compact" {
-		if updated, errDelete := sjson.DeleteBytes(translated, "stream"); errDelete == nil {
-			translated = updated
-		}
-	}
+	helps.ApplyPayloadConfigWithRequestForExecutorDoc(e.cfg, e.Identifier(), baseModel, to.String(), from.String(), "", doc, originalTranslated, requestedModel, requestPath, opts.Headers)
+	translated = doc.Bytes()
 
 	e.recordRequest(ctx, auth, endpoint, translated)
 
@@ -225,7 +221,10 @@ func (e *OIDCExecutor) executeResponsesEndpoint(ctx context.Context, auth *clipr
 		originalPayloadSource = opts.OriginalRequest
 	}
 	originalPayload := originalPayloadSource
-	originalTranslated, translated := translateCodexRequestPair(from, to, baseModel, originalPayload, req.Payload, false)
+	originalTranslated, translated, _, err := translateCodexRequestPairWithUpdateIntentContext(ctx, from, to, baseModel, originalPayload, req.Payload, false)
+	if err != nil {
+		return resp, err
+	}
 
 	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -234,18 +233,27 @@ func (e *OIDCExecutor) executeResponsesEndpoint(ctx context.Context, auth *clipr
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
-	translated = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", translated, originalTranslated, requestedModel, requestPath, opts.Headers)
-	translated, _ = sjson.SetBytes(translated, "model", baseModel)
-	translated, _ = sjson.SetBytes(translated, "stream", true)
-	translated, _ = sjson.DeleteBytes(translated, "previous_response_id")
-	translated, _ = sjson.DeleteBytes(translated, "prompt_cache_retention")
-	translated, _ = sjson.DeleteBytes(translated, "safety_identifier")
-	translated, _ = sjson.DeleteBytes(translated, "stream_options")
-	translated = normalizeCodexInstructions(translated)
-	if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
-		translated = ensureImageGenerationTool(translated, baseModel, auth, opts.Headers)
+	thinkingPayload := translated
+	buildPayload := func(retry bool) []byte {
+		doc := ojson.NewDoc(thinkingPayload)
+		_ = doc.Set("model", baseModel)
+		_ = doc.Set("stream", true)
+		_ = doc.Delete("previous_response_id")
+		_ = doc.Delete("prompt_cache_retention")
+		_ = doc.Delete("safety_identifier")
+		_ = doc.Delete("stream_options")
+		normalizeCodexInstructionsDoc(doc)
+		if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
+			ensureImageGenerationToolDoc(doc, baseModel, auth, opts.Headers)
+		}
+		e.oidcReasoningSanitize.PreSanitize(ctx, e.Identifier(), doc)
+		if retry {
+			e.oidcReasoningSanitize.Sanitize(ctx, e.Identifier(), doc)
+		}
+		helps.ApplyPayloadConfigWithRequestForExecutorDoc(e.cfg, e.Identifier(), baseModel, to.String(), from.String(), "", doc, originalTranslated, requestedModel, requestPath, opts.Headers)
+		return doc.Bytes()
 	}
-	translated = e.oidcReasoningSanitize.PreSanitize(ctx, e.Identifier(), translated)
+	translated = buildPayload(false)
 
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
 
@@ -291,7 +299,7 @@ func (e *OIDCExecutor) executeResponsesEndpoint(ctx context.Context, auth *clipr
 			return resp, err
 		}
 
-		retriedPayload := e.oidcReasoningSanitize.Sanitize(ctx, e.Identifier(), translated)
+		retriedPayload := buildPayload(true)
 		if bytes.Equal(retriedPayload, translated) {
 			return resp, err
 		}
@@ -320,7 +328,7 @@ func (e *OIDCExecutor) executeResponsesEndpoint(ctx context.Context, auth *clipr
 		}
 
 		eventData := bytes.TrimSpace(line[len(dataTag):])
-		eventType := gjson.GetBytes(eventData, "type").String()
+		eventType := ojson.GetBytes(eventData, "type").String()
 
 		if streamErr, ok := codexTerminalStreamContextLengthErr(eventData); ok {
 			return resp, streamErr
@@ -383,19 +391,24 @@ func (e *OIDCExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	if err != nil {
 		return nil, err
 	}
-	// Ensure the upstream model matches the resolved (alias-mapped) model name.
-	translated, _ = sjson.SetBytes(translated, "model", baseModel)
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
-	translated = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", translated, originalTranslated, requestedModel, requestPath)
-
-	// Request usage data in the final streaming chunk so that token statistics
-	// are captured even when the upstream is an OpenAI-compatible provider.
-	translated, _ = sjson.SetBytes(translated, "stream_options.include_usage", true)
-
-	// Sanitize the payload before sending it to the upstream
-	translated = e.oidcReasoningSanitize.PreSanitize(ctx, e.Identifier(), translated)
+	thinkingPayload := translated
+	buildPayload := func(retry bool) []byte {
+		doc := ojson.NewDoc(thinkingPayload)
+		// Ensure the upstream model matches the resolved model alias.
+		_ = doc.Set("model", baseModel)
+		// Request usage data before applying user payload rules.
+		_ = doc.Set("stream_options.include_usage", true)
+		e.oidcReasoningSanitize.PreSanitize(ctx, e.Identifier(), doc)
+		if retry {
+			e.oidcReasoningSanitize.Sanitize(ctx, e.Identifier(), doc)
+		}
+		helps.ApplyPayloadConfigWithRequestForExecutorDoc(e.cfg, e.Identifier(), baseModel, to.String(), from.String(), "", doc, originalTranslated, requestedModel, requestPath, opts.Headers)
+		return doc.Bytes()
+	}
+	translated = buildPayload(false)
 
 	var httpResp *http.Response
 	for attempt := 0; ; attempt++ {
@@ -440,7 +453,7 @@ func (e *OIDCExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 			return nil, err
 		}
 
-		retriedPayload := e.oidcReasoningSanitize.Sanitize(ctx, e.Identifier(), translated)
+		retriedPayload := buildPayload(true)
 		if bytes.Equal(retriedPayload, translated) {
 			return nil, err
 		}
@@ -538,6 +551,11 @@ func (e *OIDCExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth,
 
 	from := opts.SourceFormat
 	to := e.oidcRequestFormat(auth)
+	originalPayloadSource := req.Payload
+	if len(opts.OriginalRequest) > 0 {
+		originalPayloadSource = opts.OriginalRequest
+	}
+	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayloadSource, false)
 	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
 
 	modelForCounting := baseModel
@@ -546,6 +564,10 @@ func (e *OIDCExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth,
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
+	doc := ojson.NewDoc(translated)
+	_ = doc.Set("model", baseModel)
+	helps.ApplyPayloadConfigWithRequestForExecutorDoc(e.cfg, e.Identifier(), baseModel, to.String(), from.String(), "", doc, originalTranslated, helps.PayloadRequestedModel(opts, req.Model), helps.PayloadRequestPath(opts), opts.Headers)
+	translated = doc.Bytes()
 
 	enc, err := helps.TokenizerForModel(modelForCounting)
 	if err != nil {

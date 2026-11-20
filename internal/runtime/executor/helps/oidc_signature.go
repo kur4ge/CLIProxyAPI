@@ -10,9 +10,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/signature"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 type OIDCReasoningEncryptedContentSanitize struct {
@@ -32,17 +31,20 @@ func NewOIDCReasoningEncryptedContentSanitize() *OIDCReasoningEncryptedContentSa
 	return &OIDCReasoningEncryptedContentSanitize{}
 }
 
-func (s *OIDCReasoningEncryptedContentSanitize) PreSanitize(ctx context.Context, provider string, body []byte) []byte {
+func (s *OIDCReasoningEncryptedContentSanitize) PreSanitize(ctx context.Context, provider string, doc *ojson.Doc) bool {
 	s.ensureCache()
 
-	input := gjson.GetBytes(body, "input")
+	if doc == nil {
+		return false
+	}
+	input := doc.Get("input")
 	if !input.Exists() || !input.IsArray() {
-		return body
+		return false
 	}
 
 	provider = strings.TrimSpace(provider)
 
-	updated := body
+	changed := false
 	// Iterate in reverse so deleting array elements does not shift the
 	// indices of items we have not yet processed.
 	items := input.Array()
@@ -53,7 +55,7 @@ func (s *OIDCReasoningEncryptedContentSanitize) PreSanitize(ctx context.Context,
 		}
 
 		encryptedContentPath := fmt.Sprintf("input.%d.encrypted_content", index)
-		encryptedContent := gjson.GetBytes(updated, encryptedContentPath)
+		encryptedContent := doc.Get(encryptedContentPath)
 		if !encryptedContent.Exists() {
 			continue
 		}
@@ -66,35 +68,37 @@ func (s *OIDCReasoningEncryptedContentSanitize) PreSanitize(ctx context.Context,
 			continue
 		}
 
-		itemID := strings.TrimSpace(gjson.GetBytes(updated, fmt.Sprintf("input.%d.id", index)).String())
+		itemID := strings.TrimSpace(doc.Get(fmt.Sprintf("input.%d.id", index)).String())
 		if itemID == "" {
 			itemID = fmt.Sprintf("input[%d]", index)
 		}
 
 		itemPath := fmt.Sprintf("input.%d", index)
-		next, err := sjson.DeleteBytes(updated, itemPath)
-		if err != nil {
+		if err := doc.Delete(itemPath); err != nil {
 			LogWithRequestID(ctx).Debugf("%s: failed to pre-drop cached reasoning item at input[%d]: %v", provider, index, err)
 			continue
 		}
-		updated = next
+		changed = true
 
 		LogWithRequestID(ctx).Debugf("%s: pre-dropped cached reasoning item at input[%d] item_id=%q", provider, index, itemID)
 	}
-	return updated
+	return changed
 }
 
-func (s *OIDCReasoningEncryptedContentSanitize) Sanitize(ctx context.Context, provider string, body []byte) []byte {
+func (s *OIDCReasoningEncryptedContentSanitize) Sanitize(ctx context.Context, provider string, doc *ojson.Doc) bool {
 	s.ensureCache()
 
-	input := gjson.GetBytes(body, "input")
+	if doc == nil {
+		return false
+	}
+	input := doc.Get("input")
 	if !input.Exists() || !input.IsArray() {
-		return body
+		return false
 	}
 
 	provider = strings.TrimSpace(provider)
 
-	updated := body
+	changed := false
 	// Iterate in reverse so deleting array elements does not shift the
 	// indices of items we have not yet processed.
 	items := input.Array()
@@ -105,7 +109,7 @@ func (s *OIDCReasoningEncryptedContentSanitize) Sanitize(ctx context.Context, pr
 		}
 
 		encryptedContentPath := fmt.Sprintf("input.%d.encrypted_content", index)
-		encryptedContent := gjson.GetBytes(updated, encryptedContentPath)
+		encryptedContent := doc.Get(encryptedContentPath)
 		if !encryptedContent.Exists() {
 			continue
 		}
@@ -115,23 +119,22 @@ func (s *OIDCReasoningEncryptedContentSanitize) Sanitize(ctx context.Context, pr
 			continue
 		}
 
-		itemID := strings.TrimSpace(gjson.GetBytes(updated, fmt.Sprintf("input.%d.id", index)).String())
+		itemID := strings.TrimSpace(doc.Get(fmt.Sprintf("input.%d.id", index)).String())
 		if itemID == "" {
 			itemID = fmt.Sprintf("input[%d]", index)
 		}
 
 		itemPath := fmt.Sprintf("input.%d", index)
-		next, err := sjson.DeleteBytes(updated, itemPath)
-		if err != nil {
+		if err := doc.Delete(itemPath); err != nil {
 			LogWithRequestID(ctx).Debugf("%s: failed to drop invalid reasoning item at input[%d]: %v", provider, index, err)
 			continue
 		}
-		updated = next
+		changed = true
 		s.rememberHash(hash)
 
 		LogWithRequestID(ctx).Debugf("%s: dropped invalid reasoning item at input[%d] item_id=%q", provider, index, itemID)
 	}
-	return updated
+	return changed
 }
 
 func (s *OIDCReasoningEncryptedContentSanitize) ensureCache() {
@@ -189,9 +192,9 @@ func (s *OIDCReasoningEncryptedContentSanitize) rememberHash(hash string) {
 	s.mu.Unlock()
 }
 
-func oidcReasoningEncryptedContentHash(encryptedContent gjson.Result) (string, error) {
+func oidcReasoningEncryptedContentHash(encryptedContent ojson.Result) (string, error) {
 	value := encryptedContent.Raw
-	if encryptedContent.Type == gjson.String {
+	if encryptedContent.Type == ojson.String {
 		rawSignature := encryptedContent.String()
 		if rawSignature != strings.TrimSpace(rawSignature) {
 			errMsg := "encrypted_content has leading or trailing whitespace"
