@@ -692,7 +692,7 @@ func (e *OIDCExecutor) oidcRequestFormat(auth *cliproxyauth.Auth) sdktranslator.
 	if err != nil {
 		return ""
 	}
-	return sdktranslator.Format(config.ResponseFormat)
+	return sdktranslator.Format(config.RequestFormat)
 }
 
 func (e *OIDCExecutor) oidcResponseFormat(auth *cliproxyauth.Auth) sdktranslator.Format {
