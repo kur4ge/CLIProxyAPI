@@ -6,33 +6,49 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	coresession "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/session"
+	sdkconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
 type handlerInterceptorTestHost struct {
-	interceptRequestBeforeAuth func(context.Context, pluginapi.RequestInterceptRequest) pluginapi.RequestInterceptResponse
-	interceptRequestAfterAuth  func(context.Context, pluginapi.RequestInterceptRequest) pluginapi.RequestInterceptResponse
-	interceptResponse          func(context.Context, pluginapi.ResponseInterceptRequest) pluginapi.ResponseInterceptResponse
-	interceptStreamChunk       func(context.Context, pluginapi.StreamChunkInterceptRequest) pluginapi.StreamChunkInterceptResponse
-	completeRequest            func(context.Context, pluginapi.RequestCompletion)
+	interceptRequestBeforeAuth    func(context.Context, pluginapi.RequestInterceptRequest) pluginapi.RequestInterceptResponse
+	interceptRequestAfterAuth     func(context.Context, pluginapi.RequestInterceptRequest) pluginapi.RequestInterceptResponse
+	interceptResponse             func(context.Context, pluginapi.ResponseInterceptRequest) pluginapi.ResponseInterceptResponse
+	interceptStreamChunk          func(context.Context, pluginapi.StreamChunkInterceptRequest) pluginapi.StreamChunkInterceptResponse
+	observeWebSocketResponseEvent func(context.Context, pluginapi.WebSocketResponseEvent)
+	completeRequest               func(context.Context, pluginapi.RequestCompletion)
+	// includeStreamChunkRequestBodies simulates legacy schema_version < 3 plugins.
+	includeStreamChunkRequestBodies bool
+	// includeStreamChunkHistory simulates legacy schema_version < 5 plugins.
+	includeStreamChunkHistory bool
 }
 
 type handlerInterceptorNoStreamTestHost struct {
 	*handlerInterceptorTestHost
 }
 
+type handlerInterceptorDisabledRequestTestHost struct {
+	*handlerInterceptorTestHost
+}
+
 func (h *handlerInterceptorNoStreamTestHost) HasStreamInterceptors() bool {
+	return false
+}
+
+func (h *handlerInterceptorDisabledRequestTestHost) HasRequestInterceptors() bool {
 	return false
 }
 
@@ -42,7 +58,6 @@ func (h *handlerInterceptorTestHost) InterceptRequestBeforeAuth(ctx context.Cont
 	}
 	return pluginapi.RequestInterceptResponse{
 		Headers: cloneHeader(req.Headers),
-		Body:    cloneBytes(req.Body),
 	}
 }
 
@@ -52,7 +67,6 @@ func (h *handlerInterceptorTestHost) InterceptRequestAfterAuth(ctx context.Conte
 	}
 	return pluginapi.RequestInterceptResponse{
 		Headers: cloneHeader(req.Headers),
-		Body:    cloneBytes(req.Body),
 	}
 }
 
@@ -80,6 +94,30 @@ func (h *handlerInterceptorTestHost) CompleteRequest(ctx context.Context, comple
 	if h != nil && h.completeRequest != nil {
 		h.completeRequest(ctx, completion)
 	}
+}
+
+func (h *handlerInterceptorTestHost) ObserveWebSocketResponseEvent(ctx context.Context, event pluginapi.WebSocketResponseEvent) {
+	if h != nil && h.observeWebSocketResponseEvent != nil {
+		h.observeWebSocketResponseEvent(ctx, event)
+	}
+}
+
+// StreamChunkPayloadIncludesRequestBody implements streamChunkRequestBodyPolicy.
+// Default false simulates schema_version >= 3 (omit request bodies on payload chunks).
+func (h *handlerInterceptorTestHost) StreamChunkPayloadIncludesRequestBody() bool {
+	if h == nil {
+		return false
+	}
+	return h.includeStreamChunkRequestBodies
+}
+
+// StreamChunkPayloadIncludesHistory implements streamChunkHistoryPolicy.
+// Default false simulates schema_version >= 5 (omit history on payload chunks).
+func (h *handlerInterceptorTestHost) StreamChunkPayloadIncludesHistory() bool {
+	if h == nil {
+		return false
+	}
+	return h.includeStreamChunkHistory
 }
 
 type interceptorCaptureExecutor struct {
@@ -555,6 +593,80 @@ func TestHandlerRequestInterceptorRewritesExecutorRequest(t *testing.T) {
 	}
 }
 
+func TestHandlerSkipsDisabledRequestInterceptorsWithoutCopyingPayload(t *testing.T) {
+	payload := []byte(`{"model":"disabled-interceptor-model"}`)
+	called := false
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, nil)
+	handler.SetPluginHost(&handlerInterceptorDisabledRequestTestHost{
+		handlerInterceptorTestHost: &handlerInterceptorTestHost{
+			interceptRequestBeforeAuth: func(context.Context, pluginapi.RequestInterceptRequest) pluginapi.RequestInterceptResponse {
+				called = true
+				return pluginapi.RequestInterceptResponse{Body: []byte(`{"unexpected":true}`)}
+			},
+		},
+	})
+
+	req := coreexecutor.Request{Model: "disabled-interceptor-model", Payload: payload}
+	opts := coreexecutor.Options{OriginalRequest: payload}
+	gotReq, gotOpts, err := handler.applyRequestInterceptorsBeforeAuth(context.Background(), "openai", req.Model, "test-req", req, opts, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if called {
+		t.Fatal("disabled request interceptor was called")
+	}
+	if len(gotReq.Payload) != len(payload) || &gotReq.Payload[0] != &payload[0] {
+		t.Fatal("request payload was copied")
+	}
+	if len(gotOpts.OriginalRequest) != len(payload) || &gotOpts.OriginalRequest[0] != &payload[0] {
+		t.Fatal("original request was copied")
+	}
+}
+
+func BenchmarkHandlerRequestInterceptors(b *testing.B) {
+	sizes := []struct {
+		name  string
+		bytes int
+	}{
+		{name: "1KiB", bytes: 1 << 10},
+		{name: "1MiB", bytes: 1 << 20},
+		{name: "8MiB", bytes: 8 << 20},
+	}
+	hosts := []struct {
+		name string
+		host PluginInterceptorHost
+	}{
+		{
+			name: "disabled",
+			host: &handlerInterceptorDisabledRequestTestHost{
+				handlerInterceptorTestHost: &handlerInterceptorTestHost{},
+			},
+		},
+		{name: "active", host: &handlerInterceptorTestHost{}},
+	}
+
+	for _, size := range sizes {
+		payload := make([]byte, size.bytes)
+		req := coreexecutor.Request{Model: "benchmark-model", Payload: payload}
+		opts := coreexecutor.Options{OriginalRequest: payload}
+		for _, host := range hosts {
+			b.Run(host.name+"/"+size.name, func(b *testing.B) {
+				handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, nil)
+				handler.SetPluginHost(host.host)
+				b.ReportAllocs()
+				b.ResetTimer()
+				for range b.N {
+					gotReq, gotOpts, _ := handler.applyRequestInterceptorsBeforeAuth(context.Background(), "openai", req.Model, "benchmark-req", req, opts, "")
+					if len(gotReq.Payload) != size.bytes || len(gotOpts.OriginalRequest) != size.bytes {
+						b.Fatal("request payload length changed")
+					}
+				}
+			})
+		}
+	}
+}
+
 func TestHandlerRequestInterceptorEmptyBodyKeepsOriginalPayload(t *testing.T) {
 	model := "handler-interceptor-empty-body-model"
 	executor := &interceptorCaptureExecutor{}
@@ -875,6 +987,7 @@ func TestHandlerStreamInterceptorRewritesAndDropsChunks(t *testing.T) {
 	handler := newInterceptorHandler(t, model, executor, &sdkconfig.SDKConfig{PassthroughHeaders: true})
 	var streamCalls int
 	handler.SetPluginHost(&handlerInterceptorTestHost{
+		includeStreamChunkHistory: true,
 		interceptRequestBeforeAuth: func(ctx context.Context, req pluginapi.RequestInterceptRequest) pluginapi.RequestInterceptResponse {
 			headers := cloneHeader(req.Headers)
 			if headers == nil {
@@ -905,16 +1018,22 @@ func TestHandlerStreamInterceptorRewritesAndDropsChunks(t *testing.T) {
 			if req.RequestHeaders.Get("X-Stage") != "after" {
 				t.Fatalf("stream request headers = %#v, want after-auth header", req.RequestHeaders)
 			}
-			if string(req.OriginalRequest) != `{"stage":"after-stream"}` {
-				t.Fatalf("stream original request = %q, want after-auth body", req.OriginalRequest)
-			}
-			if string(req.RequestBody) != `{"stage":"after-stream"}` {
-				t.Fatalf("stream request body = %q, want after-auth body", req.RequestBody)
-			}
 			if req.ChunkIndex == pluginapi.StreamChunkHeaderInitIndex {
+				if string(req.OriginalRequest) != `{"stage":"after-stream"}` {
+					t.Fatalf("stream original request = %q, want after-auth body", req.OriginalRequest)
+				}
+				if string(req.RequestBody) != `{"stage":"after-stream"}` {
+					t.Fatalf("stream request body = %q, want after-auth body", req.RequestBody)
+				}
 				headers := cloneHeader(req.ResponseHeaders)
 				headers.Set("X-Stream", "plugin")
 				return pluginapi.StreamChunkInterceptResponse{Headers: headers}
+			}
+			if len(req.OriginalRequest) != 0 {
+				t.Fatalf("payload chunk OriginalRequest = %q, want omitted for schema v3+", req.OriginalRequest)
+			}
+			if len(req.RequestBody) != 0 {
+				t.Fatalf("payload chunk RequestBody = %q, want omitted for schema v3+", req.RequestBody)
 			}
 			if req.ResponseHeaders.Get("X-Upstream") != "stream" {
 				t.Fatalf("stream response headers = %#v, want upstream header", req.ResponseHeaders)
@@ -954,6 +1073,156 @@ func TestHandlerStreamInterceptorRewritesAndDropsChunks(t *testing.T) {
 	}
 	if streamCalls != 4 {
 		t.Fatalf("stream interceptor calls = %d, want 4", streamCalls)
+	}
+}
+
+func TestHandlerStreamInterceptorLegacySchemaClonesRequestBodiesOnPayloadChunks(t *testing.T) {
+	model := "handler-interceptor-stream-legacy-clone-model"
+	executor := &interceptorCaptureExecutor{
+		stream: func(ctx context.Context, auth *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+			chunks := make(chan coreexecutor.StreamChunk, 2)
+			chunks <- coreexecutor.StreamChunk{Payload: []byte("first")}
+			chunks <- coreexecutor.StreamChunk{Payload: []byte("second")}
+			close(chunks)
+			return &coreexecutor.StreamResult{
+				Headers: http.Header{"X-Upstream": []string{"stream"}},
+				Chunks:  chunks,
+			}, nil
+		},
+	}
+	handler := newInterceptorHandler(t, model, executor, &sdkconfig.SDKConfig{PassthroughHeaders: true})
+	var payloadBodies [][]byte
+	handler.SetPluginHost(&handlerInterceptorTestHost{
+		includeStreamChunkRequestBodies: true,
+		interceptRequestAfterAuth: func(ctx context.Context, req pluginapi.RequestInterceptRequest) pluginapi.RequestInterceptResponse {
+			return pluginapi.RequestInterceptResponse{Body: []byte(`{"stage":"legacy-stream"}`)}
+		},
+		interceptStreamChunk: func(ctx context.Context, req pluginapi.StreamChunkInterceptRequest) pluginapi.StreamChunkInterceptResponse {
+			if req.ChunkIndex == pluginapi.StreamChunkHeaderInitIndex {
+				if string(req.OriginalRequest) != `{"stage":"legacy-stream"}` || string(req.RequestBody) != `{"stage":"legacy-stream"}` {
+					t.Fatalf("header-init bodies = original:%q body:%q", req.OriginalRequest, req.RequestBody)
+				}
+				// Mutate delivered slices; later chunks must not observe this mutation.
+				req.OriginalRequest[0] = 'X'
+				req.RequestBody[0] = 'Y'
+				return pluginapi.StreamChunkInterceptResponse{}
+			}
+			if string(req.OriginalRequest) != `{"stage":"legacy-stream"}` {
+				t.Fatalf("payload OriginalRequest = %q, want isolated clone of after-auth body", req.OriginalRequest)
+			}
+			if string(req.RequestBody) != `{"stage":"legacy-stream"}` {
+				t.Fatalf("payload RequestBody = %q, want isolated clone of after-auth body", req.RequestBody)
+			}
+			payloadBodies = append(payloadBodies, req.OriginalRequest)
+			req.OriginalRequest[0] = 'Z'
+			return pluginapi.StreamChunkInterceptResponse{Body: req.Body}
+		},
+	})
+
+	dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(context.Background(), "openai", model, []byte(fmt.Sprintf(`{"model":%q}`, model)), "")
+	for range dataChan {
+	}
+	for msg := range errChan {
+		if msg != nil {
+			t.Fatalf("unexpected stream error: %+v", msg)
+		}
+	}
+	if len(payloadBodies) != 2 {
+		t.Fatalf("payload body deliveries = %d, want 2", len(payloadBodies))
+	}
+	if &payloadBodies[0][0] == &payloadBodies[1][0] {
+		t.Fatal("payload OriginalRequest slices alias across chunks; want fresh clones")
+	}
+}
+
+func TestHandlerStreamInterceptorModernSchemaOmitsHistoryOnPayloadChunks(t *testing.T) {
+	model := "handler-interceptor-stream-modern-omit-history-model"
+	executor := &interceptorCaptureExecutor{
+		stream: func(ctx context.Context, auth *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+			chunks := make(chan coreexecutor.StreamChunk, 2)
+			chunks <- coreexecutor.StreamChunk{Payload: []byte("first")}
+			chunks <- coreexecutor.StreamChunk{Payload: []byte("second")}
+			close(chunks)
+			return &coreexecutor.StreamResult{
+				Headers: http.Header{"X-Upstream": []string{"stream"}},
+				Chunks:  chunks,
+			}, nil
+		},
+	}
+	handler := newInterceptorHandler(t, model, executor, &sdkconfig.SDKConfig{PassthroughHeaders: true})
+	var observedHistories [][][]byte
+	handler.SetPluginHost(&handlerInterceptorTestHost{
+		includeStreamChunkHistory: false,
+		interceptStreamChunk: func(ctx context.Context, req pluginapi.StreamChunkInterceptRequest) pluginapi.StreamChunkInterceptResponse {
+			if req.ChunkIndex == pluginapi.StreamChunkHeaderInitIndex {
+				return pluginapi.StreamChunkInterceptResponse{}
+			}
+			observedHistories = append(observedHistories, cloneByteSlices(req.HistoryChunks))
+			return pluginapi.StreamChunkInterceptResponse{Body: req.Body}
+		},
+	})
+
+	dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(context.Background(), "openai", model, []byte(fmt.Sprintf(`{"model":%q}`, model)), "")
+	for range dataChan {
+	}
+	for msg := range errChan {
+		if msg != nil {
+			t.Fatalf("unexpected stream error: %+v", msg)
+		}
+	}
+	if len(observedHistories) != 2 {
+		t.Fatalf("payload chunk count = %d, want 2", len(observedHistories))
+	}
+	for i, h := range observedHistories {
+		if len(h) != 0 {
+			t.Fatalf("chunk %d history = %#v, want omitted for schema v5+", i, h)
+		}
+	}
+}
+
+func TestHandlerStreamInterceptorLegacySchemaClonesHistoryChunksOnPayloadChunks(t *testing.T) {
+	model := "handler-interceptor-stream-legacy-history-model"
+	executor := &interceptorCaptureExecutor{
+		stream: func(ctx context.Context, auth *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+			chunks := make(chan coreexecutor.StreamChunk, 2)
+			chunks <- coreexecutor.StreamChunk{Payload: []byte("first")}
+			chunks <- coreexecutor.StreamChunk{Payload: []byte("second")}
+			close(chunks)
+			return &coreexecutor.StreamResult{
+				Headers: http.Header{"X-Upstream": []string{"stream"}},
+				Chunks:  chunks,
+			}, nil
+		},
+	}
+	handler := newInterceptorHandler(t, model, executor, &sdkconfig.SDKConfig{PassthroughHeaders: true})
+	var observedHistories [][][]byte
+	handler.SetPluginHost(&handlerInterceptorTestHost{
+		includeStreamChunkHistory: true,
+		interceptStreamChunk: func(ctx context.Context, req pluginapi.StreamChunkInterceptRequest) pluginapi.StreamChunkInterceptResponse {
+			if req.ChunkIndex == pluginapi.StreamChunkHeaderInitIndex {
+				return pluginapi.StreamChunkInterceptResponse{}
+			}
+			observedHistories = append(observedHistories, cloneByteSlices(req.HistoryChunks))
+			return pluginapi.StreamChunkInterceptResponse{Body: req.Body}
+		},
+	})
+
+	dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(context.Background(), "openai", model, []byte(fmt.Sprintf(`{"model":%q}`, model)), "")
+	for range dataChan {
+	}
+	for msg := range errChan {
+		if msg != nil {
+			t.Fatalf("unexpected stream error: %+v", msg)
+		}
+	}
+	if len(observedHistories) != 2 {
+		t.Fatalf("payload chunk count = %d, want 2", len(observedHistories))
+	}
+	if len(observedHistories[0]) != 0 {
+		t.Fatalf("chunk 0 history = %#v, want empty", observedHistories[0])
+	}
+	if len(observedHistories[1]) != 1 || string(observedHistories[1][0]) != "first" {
+		t.Fatalf("chunk 1 history = %#v, want ['first']", observedHistories[1])
 	}
 }
 
@@ -1322,4 +1591,328 @@ func TestHandlerResponseInterceptorSeesRawHeadersWhenPassthroughDisabled(t *test
 	if headers.Get("X-Upstream") != "" {
 		t.Fatalf("headers leaked raw upstream header with passthrough disabled: %#v", headers)
 	}
+}
+
+func TestHandlerWebSocketResponseObserverForwardsToPluginHost(t *testing.T) {
+	model := "handler-ws-observer-model"
+	var observed []pluginapi.WebSocketResponseEvent
+	executor := &interceptorCaptureExecutor{
+		execute: func(ctx context.Context, auth *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) (coreexecutor.Response, error) {
+			if opts.WebSocketResponseObserver != nil {
+				opts.WebSocketResponseObserver(ctx, coreexecutor.WebSocketResponseEvent{
+					SourceFormat: opts.SourceFormat.String(),
+					Model:        req.Model,
+					Provider:     "codex",
+					AuthID:       "auth-test",
+					EventType:    "codex.rate_limits",
+					Payload:      []byte(`{"type":"codex.rate_limits"}`),
+				})
+			}
+			return coreexecutor.Response{Payload: []byte(`{"id":"resp-1"}`)}, nil
+		},
+	}
+	handler := newInterceptorHandler(t, model, executor, nil)
+	handler.SetPluginHost(&handlerInterceptorTestHost{
+		observeWebSocketResponseEvent: func(ctx context.Context, event pluginapi.WebSocketResponseEvent) {
+			observed = append(observed, event)
+		},
+	})
+
+	_, _, errMsg := handler.ExecuteWithAuthManager(context.Background(), "openai", model, []byte(fmt.Sprintf(`{"model":%q}`, model)), "")
+	if errMsg != nil {
+		t.Fatalf("ExecuteWithAuthManager() error = %+v", errMsg)
+	}
+
+	if len(observed) != 1 {
+		t.Fatalf("observed %d events, want 1", len(observed))
+	}
+	if observed[0].EventType != "codex.rate_limits" {
+		t.Fatalf("EventType = %q, want codex.rate_limits", observed[0].EventType)
+	}
+	if observed[0].AuthID != "auth-test" {
+		t.Fatalf("AuthID = %q, want auth-test", observed[0].AuthID)
+	}
+	if observed[0].RequestID == "" {
+		t.Fatal("RequestID is empty, want populated request ID")
+	}
+}
+
+func TestWriteModelListResponse_ExposesResponseToPluginInterceptors(t *testing.T) {
+	handler := &BaseAPIHandler{}
+	var intercepted bool
+	var capturedReq pluginapi.ResponseInterceptRequest
+	var completion pluginapi.RequestCompletion
+
+	handler.SetPluginHost(&handlerInterceptorTestHost{
+		interceptResponse: func(_ context.Context, req pluginapi.ResponseInterceptRequest) pluginapi.ResponseInterceptResponse {
+			intercepted = true
+			capturedReq = req
+			headers := cloneHeader(req.ResponseHeaders)
+			headers.Set("X-Custom-Model-Header", "filtered")
+			return pluginapi.ResponseInterceptResponse{
+				Headers: headers,
+				Body:    []byte(`{"object":"list","data":[{"id":"intercepted-model"}]}`),
+			}
+		},
+		completeRequest: func(_ context.Context, comp pluginapi.RequestCompletion) {
+			completion = comp
+		},
+	})
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	ctx.Request.Header.Set("Authorization", "Bearer test-token")
+
+	payload := gin.H{"object": "list", "data": []map[string]any{{"id": "original-model"}}}
+	handler.WriteModelListResponse(ctx, "openai", payload)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if !intercepted {
+		t.Fatal("InterceptResponse was not called")
+	}
+	if capturedReq.SourceFormat != "openai" {
+		t.Fatalf("SourceFormat = %q, want openai", capturedReq.SourceFormat)
+	}
+	if capturedReq.RequestHeaders.Get("Authorization") != "Bearer test-token" {
+		t.Fatalf("RequestHeaders missing auth: %#v", capturedReq.RequestHeaders)
+	}
+	if rec.Header().Get("X-Custom-Model-Header") != "filtered" {
+		t.Fatalf("X-Custom-Model-Header = %q, want filtered", rec.Header().Get("X-Custom-Model-Header"))
+	}
+	if !strings.Contains(rec.Body.String(), "intercepted-model") {
+		t.Fatalf("body = %s, want intercepted-model", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "original-model") {
+		t.Fatalf("body should not contain original-model: %s", rec.Body.String())
+	}
+	if completion.Outcome != pluginapi.RequestCompletionSucceeded {
+		t.Fatalf("completion outcome = %v, want succeeded", completion.Outcome)
+	}
+	if apiResp, ok := ctx.Get("API_RESPONSE"); !ok || !strings.Contains(string(apiResp.([]byte)), "intercepted-model") {
+		t.Fatalf("API_RESPONSE not recorded properly: %#v", apiResp)
+	}
+}
+
+func TestWriteModelListResponse_ForwardsCallerIdentityToInterceptors(t *testing.T) {
+	handler := &BaseAPIHandler{}
+	var capturedReq pluginapi.ResponseInterceptRequest
+	var completion pluginapi.RequestCompletion
+
+	handler.SetPluginHost(&handlerInterceptorTestHost{
+		interceptResponse: func(_ context.Context, req pluginapi.ResponseInterceptRequest) pluginapi.ResponseInterceptResponse {
+			capturedReq = req
+			return pluginapi.ResponseInterceptResponse{}
+		},
+		completeRequest: func(_ context.Context, comp pluginapi.RequestCompletion) {
+			completion = comp
+		},
+	})
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1beta/models?key=query-credential", nil)
+	ctx.Set("userApiKey", "plugin-principal-123")
+	ctx.Set("accessProvider", "plugin-frontend-auth")
+	ctx.Set("accessMetadata", map[string]string{"source": "query-key", "team": "alpha"})
+
+	payload := gin.H{"models": []map[string]any{{"name": "models/gemini-3-pro"}}}
+	handler.WriteModelListResponse(ctx, "gemini", payload)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	wantScope := coresession.CallerScope("plugin-principal-123")
+	if got := capturedReq.Metadata[pluginapi.CallerScopeMetadataKey]; got != wantScope {
+		t.Fatalf("Metadata[%q] = %v, want %q", pluginapi.CallerScopeMetadataKey, got, wantScope)
+	}
+	if got := capturedReq.Metadata["access_provider"]; got != "plugin-frontend-auth" {
+		t.Fatalf("Metadata[access_provider] = %v, want plugin-frontend-auth", got)
+	}
+	rawAuthMeta, ok := capturedReq.Metadata["frontend_auth_metadata"].(map[string]string)
+	if !ok {
+		t.Fatalf("Metadata[frontend_auth_metadata] type = %T, want map[string]string", capturedReq.Metadata["frontend_auth_metadata"])
+	}
+	if rawAuthMeta["source"] != "query-key" || rawAuthMeta["team"] != "alpha" {
+		t.Fatalf("frontend_auth_metadata = %#v, want source=query-key team=alpha", rawAuthMeta)
+	}
+	if got := completion.Metadata[pluginapi.CallerScopeMetadataKey]; got != wantScope {
+		t.Fatalf("completion Metadata[%q] = %v, want %q", pluginapi.CallerScopeMetadataKey, got, wantScope)
+	}
+
+	// The forwarded auth metadata must be a clone: mutating the interceptor-visible
+	// map must not corrupt the gin context copy shared with other consumers.
+	rawAuthMeta["source"] = "mutated-by-plugin"
+	ctxMeta, _ := ctx.Get("accessMetadata")
+	if got := ctxMeta.(map[string]string)["source"]; got != "query-key" {
+		t.Fatalf("accessMetadata[source] in context = %q, want query-key (interceptor metadata must be isolated)", got)
+	}
+}
+
+func TestWriteModelListResponse_MetadataNilWithoutAuthContext(t *testing.T) {
+	handler := &BaseAPIHandler{}
+	var capturedReq pluginapi.ResponseInterceptRequest
+
+	handler.SetPluginHost(&handlerInterceptorTestHost{
+		interceptResponse: func(_ context.Context, req pluginapi.ResponseInterceptRequest) pluginapi.ResponseInterceptResponse {
+			capturedReq = req
+			return pluginapi.ResponseInterceptResponse{}
+		},
+	})
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+
+	handler.WriteModelListResponse(ctx, "openai", gin.H{"object": "list", "data": []map[string]any{}})
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if capturedReq.Metadata != nil {
+		t.Fatalf("Metadata = %#v, want nil for unauthenticated context", capturedReq.Metadata)
+	}
+}
+
+func TestRequestAfterAuthCapture_ReadOnlyInterceptorDoesNotReallocatePayload_Issue6101(t *testing.T) {
+	capture := &requestAfterAuthCapture{}
+	payload := []byte(`{"messages":[{"role":"user","content":"hello"}]}`)
+	req := coreexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: payload,
+	}
+	opts := coreexecutor.Options{
+		OriginalRequest: payload,
+	}
+
+	// Read-only after-auth response: Body is empty
+	capture.record(coreexecutor.RequestAfterAuthInterceptRequest{
+		Body: payload,
+	}, coreexecutor.RequestAfterAuthInterceptResponse{
+		Body: nil,
+	})
+
+	appliedReq, appliedOpts := capture.apply(req, opts)
+	if unsafe.SliceData(appliedReq.Payload) != unsafe.SliceData(req.Payload) {
+		t.Fatal("requestAfterAuthCapture.apply reallocated req.Payload when interceptor did not mutate body")
+	}
+	if unsafe.SliceData(appliedOpts.OriginalRequest) != unsafe.SliceData(opts.OriginalRequest) {
+		t.Fatal("requestAfterAuthCapture.apply reallocated opts.OriginalRequest when interceptor did not mutate body")
+	}
+}
+
+func TestApplyRequestInterceptors_ReadOnlyInterceptorDoesNotReallocatePayload_Issue6101(t *testing.T) {
+	// A read-only interceptor returns an empty/nil Body.
+	host := &handlerInterceptorTestHost{
+		interceptRequestBeforeAuth: func(ctx context.Context, req pluginapi.RequestInterceptRequest) pluginapi.RequestInterceptResponse {
+			return pluginapi.RequestInterceptResponse{
+				Headers: req.Headers,
+			}
+		},
+	}
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, nil)
+	handler.SetPluginHost(host)
+
+	payload := []byte(`{"messages":[{"role":"user","content":"hello"}]}`)
+	req := coreexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: payload,
+	}
+	opts := coreexecutor.Options{
+		OriginalRequest: payload,
+	}
+
+	gotReq, gotOpts, err := handler.applyRequestInterceptorsBeforeAuth(context.Background(), "openai", "gpt-5.4", "req-1", req, opts, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if unsafe.SliceData(gotReq.Payload) != unsafe.SliceData(req.Payload) {
+		t.Fatal("applyRequestInterceptorsBeforeAuth reallocated req.Payload when interceptor did not mutate body")
+	}
+	if unsafe.SliceData(gotOpts.OriginalRequest) != unsafe.SliceData(opts.OriginalRequest) {
+		t.Fatal("applyRequestInterceptorsBeforeAuth reallocated opts.OriginalRequest when interceptor did not mutate body")
+	}
+}
+
+func TestResponseInterceptRequest_SetsKindAcrossAuthManagerAndModelListPaths(t *testing.T) {
+	t.Run("auth_manager_execution", func(t *testing.T) {
+		model := "handler-interceptor-kind-exec"
+		executor := &interceptorCaptureExecutor{}
+		handler := newInterceptorHandler(t, model, executor, &sdkconfig.SDKConfig{})
+		var capturedReq pluginapi.ResponseInterceptRequest
+		handler.SetPluginHost(&handlerInterceptorTestHost{
+			interceptResponse: func(_ context.Context, req pluginapi.ResponseInterceptRequest) pluginapi.ResponseInterceptResponse {
+				capturedReq = req
+				return pluginapi.ResponseInterceptResponse{}
+			},
+		})
+
+		body, _, errMsg := handler.ExecuteWithAuthManager(context.Background(), "openai", model, []byte(fmt.Sprintf(`{"model":%q}`, model)), "")
+		if errMsg != nil || string(body) != "ok" {
+			t.Fatalf("ExecuteWithAuthManager() body = %q, error = %#v", body, errMsg)
+		}
+		if capturedReq.Kind != pluginapi.ResponseInterceptKindExecution {
+			t.Fatalf("ResponseInterceptRequest.Kind = %q, want %q", capturedReq.Kind, pluginapi.ResponseInterceptKindExecution)
+		}
+	})
+
+	t.Run("auth_manager_count_tokens", func(t *testing.T) {
+		model := "handler-interceptor-kind-count"
+		executor := &interceptorCaptureExecutor{}
+		handler := newInterceptorHandler(t, model, executor, &sdkconfig.SDKConfig{})
+		var capturedReq pluginapi.ResponseInterceptRequest
+		handler.SetPluginHost(&handlerInterceptorTestHost{
+			interceptResponse: func(_ context.Context, req pluginapi.ResponseInterceptRequest) pluginapi.ResponseInterceptResponse {
+				capturedReq = req
+				return pluginapi.ResponseInterceptResponse{}
+			},
+		})
+
+		body, _, errMsg := handler.ExecuteCountWithAuthManager(context.Background(), "claude", model, []byte(fmt.Sprintf(`{"model":%q}`, model)), "")
+		if errMsg != nil || string(body) != "0" {
+			t.Fatalf("ExecuteCountWithAuthManager() body = %q, error = %#v", body, errMsg)
+		}
+		if capturedReq.Kind != pluginapi.ResponseInterceptKindCountTokens {
+			t.Fatalf("ResponseInterceptRequest.Kind = %q, want %q", capturedReq.Kind, pluginapi.ResponseInterceptKindCountTokens)
+		}
+	})
+
+	t.Run("model_list_with_populated_metadata", func(t *testing.T) {
+		handler := &BaseAPIHandler{}
+		var capturedReq pluginapi.ResponseInterceptRequest
+		handler.SetPluginHost(&handlerInterceptorTestHost{
+			interceptResponse: func(_ context.Context, req pluginapi.ResponseInterceptRequest) pluginapi.ResponseInterceptResponse {
+				capturedReq = req
+				return pluginapi.ResponseInterceptResponse{}
+			},
+		})
+
+		rec := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(rec)
+		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		req = req.WithContext(logging.WithRequestID(req.Context(), "trace-7655"))
+		ctx.Request = req
+		ctx.Set("userApiKey", "caller-principal-7655")
+		ctx.Set("accessProvider", "plugin-frontend-auth")
+		ctx.Set("accessMetadata", map[string]string{"tier": "restricted"})
+
+		handler.WriteModelListResponse(ctx, "openai", gin.H{
+			"object": "list",
+			"data":   []map[string]any{{"id": "gpt-5"}},
+		})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("code = %d, want %d", rec.Code, http.StatusOK)
+		}
+		reqID, okReqID := capturedReq.Metadata[coreexecutor.RequestIDMetadataKey].(string)
+		traceID, okTraceID := capturedReq.Metadata[coreexecutor.TraceIDMetadataKey].(string)
+		if !okReqID || reqID == "" || reqID != capturedReq.RequestID || !okTraceID || traceID != "trace-7655" {
+			t.Fatalf("expected lifecycle request_id (%q) and trace_id in metadata, got %#v", capturedReq.RequestID, capturedReq.Metadata)
+		}
+		if capturedReq.Kind != pluginapi.ResponseInterceptKindModelList {
+			t.Fatalf("ResponseInterceptRequest.Kind = %q, want %q", capturedReq.Kind, pluginapi.ResponseInterceptKindModelList)
+		}
+	})
 }

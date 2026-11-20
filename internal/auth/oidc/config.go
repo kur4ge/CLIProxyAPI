@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 )
 
 func SelectOIDCConfig(cfg *config.Config, initName string) (*config.OIDCConfig, error) {

@@ -2,17 +2,18 @@ package executor
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"net/url"
 	"sort"
 	"strings"
 
+	"github.com/MoeForge/moego/json"
+	"github.com/MoeForge/moego/ojson"
 	xxHash64 "github.com/pierrec/xxHash/xxHash64"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
+	claudeauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/claude"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 const (
@@ -56,9 +57,26 @@ func finalizeAnthropicMessagesBodyCCH(body []byte, fallbackBilling string) ([]by
 	return signAnthropicMessagesBody(bodyWithPlaceholder)
 }
 
+// claudeBodyNeedsBillingFallback reports whether a confirmed native helper request
+// still needs CPA's billing-header fallback.
+//
+// The measured minimal helper carries no system field at all, which is exactly the
+// native wire shape, so injecting a billing header there would be the deviation.
+// Keying on "system is absent" rather than "no billing header present" means that
+// if anything later in the pipeline (a payload rule, for instance) does attach a
+// system prompt, the fallback comes back and the request cannot go upstream with a
+// system block that native would never send unsigned.
+func claudeBodyNeedsBillingFallback(body []byte) bool {
+	return ojson.GetBytesNoCopy(body, "system").Exists()
+}
+
+func claudeBodyNeedsBillingFallbackDoc(doc *ojson.Doc) bool {
+	return doc != nil && doc.Get("system").Exists()
+}
+
 func ensureClaudeBillingHeaderCCHPlaceholder(body []byte, fallbackBilling string) ([]byte, error) {
-	billing := gjson.GetBytes(body, "system.0.text")
-	if billing.Type != gjson.String || !strings.HasPrefix(billing.String(), "x-anthropic-billing-header:") {
+	billing := ojson.GetBytesNoCopy(body, "system.0.text")
+	if billing.Type != ojson.String || !strings.HasPrefix(billing.String(), "x-anthropic-billing-header:") {
 		if fallbackBilling == "" {
 			return body, nil
 		}
@@ -67,7 +85,7 @@ func ensureClaudeBillingHeaderCCHPlaceholder(body []byte, fallbackBilling string
 		if errPrepend != nil {
 			return nil, errPrepend
 		}
-		billing = gjson.GetBytes(body, "system.0.text")
+		billing = ojson.GetBytesNoCopy(body, "system.0.text")
 	}
 	if _, ok := claudeBillingCCHDigitsOffset(body); ok {
 		return body, nil
@@ -84,19 +102,65 @@ func ensureClaudeBillingHeaderCCHPlaceholder(body []byte, fallbackBilling string
 	}
 	insertAt := entrypoint + entrypointEnd + 1
 	billingText = billingText[:insertAt] + " cch=00000;" + billingText[insertAt:]
-	updated, err := sjson.SetBytes(body, "system.0.text", billingText)
+	updated, err := ojson.SetBytes(body, "system.0.text", billingText)
 	if err != nil {
 		return nil, fmt.Errorf("insert Claude CCH placeholder: %w", err)
 	}
 	return updated, nil
 }
 
+func ensureClaudeBillingHeaderCCHPlaceholderDoc(doc *ojson.Doc, fallbackBilling string) error {
+	if doc == nil {
+		return nil
+	}
+	billing := doc.Get("system.0.text")
+	if billing.Type != ojson.String || !strings.HasPrefix(billing.String(), "x-anthropic-billing-header:") {
+		if fallbackBilling == "" {
+			return nil
+		}
+		if errPrepend := prependClaudeBillingSystemBlockDoc(doc, fallbackBilling); errPrepend != nil {
+			return errPrepend
+		}
+		billing = doc.Get("system.0.text")
+	}
+	if claudeBillingRawHasCCHDigits(billing.Raw) {
+		return nil
+	}
+
+	billingText := billing.String()
+	entrypoint := strings.Index(billingText, "cc_entrypoint=")
+	if entrypoint < 0 {
+		return nil
+	}
+	entrypointEnd := strings.IndexByte(billingText[entrypoint:], ';')
+	if entrypointEnd < 0 {
+		return nil
+	}
+	insertAt := entrypoint + entrypointEnd + 1
+	billingText = billingText[:insertAt] + " cch=00000;" + billingText[insertAt:]
+	if errSet := doc.Set("system.0.text", billingText); errSet != nil {
+		return fmt.Errorf("insert Claude CCH placeholder: %w", errSet)
+	}
+	return nil
+}
+
 func prependClaudeBillingSystemBlock(body []byte, billingText string) ([]byte, error) {
+	doc := ojson.NewDoc(body)
+	if errPrepend := prependClaudeBillingSystemBlockDoc(doc, billingText); errPrepend != nil {
+		return nil, errPrepend
+	}
+	return doc.Bytes(), nil
+}
+
+func prependClaudeBillingSystemBlockDoc(doc *ojson.Doc, billingText string) error {
+	if doc == nil {
+		return nil
+	}
 	billingBlock := []byte(buildTextBlock(billingText, nil))
-	system := gjson.GetBytes(body, "system")
+	system := doc.Get("system")
 	var systemArray []byte
 	switch {
-	case system.Type == gjson.String:
+	case system.Type == ojson.String:
 		originalBlock := []byte(buildTextBlock(system.String(), nil))
 		systemArray = make([]byte, 0, len(billingBlock)+len(originalBlock)+3)
 		systemArray = append(systemArray, '[')
@@ -125,37 +189,124 @@ func prependClaudeBillingSystemBlock(body []byte, billingText string) ([]byte, e
 		systemArray = append(systemArray, ']')
 	}
 
-	updated, err := sjson.SetRawBytes(body, "system", systemArray)
-	if err != nil {
-		return nil, fmt.Errorf("prepend Claude CCH billing block: %w", err)
+	if errSet := doc.SetRawBytes("system", systemArray); errSet != nil {
+		return fmt.Errorf("prepend Claude CCH billing block: %w", errSet)
 	}
-	return updated, nil
+	return nil
 }
 
-// claudeCCHSigningEnabled applies CPA's CCH policy. Every Claude OAuth
-// request is signed, while non-OAuth requests require a supported upstream.
-func claudeCCHSigningEnabled(apiKey string, kind claudeCCHUpstreamKind, endpoint string) bool {
+func isKimiAPIEndpoint(endpoint string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(endpoint))
+	if err != nil {
+		return false
+	}
+	host := parsed.Hostname()
+	return strings.EqualFold(host, "api.kimi.com") || strings.EqualFold(host, "api.kimi.ai")
+}
+
+func isKimiMessagesUpstream(auth *cliproxyauth.Auth, endpoint string) bool {
+	if auth != nil {
+		provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+		if provider == "kimi" || provider == "kimi-ai" || provider == "kimi.ai" || provider == "kimi.com" {
+			return true
+		}
+	}
+	return isKimiAPIEndpoint(endpoint)
+}
+
+// stripDefaultKimiClaudeCodeAttribution removes the Claude Code billing/CCH
+// attribution block from a Kimi Messages body when the caller did not opt into
+// the full CLI profile. Kimi treats the block as prompt text, so forwarding it
+// unchanged would leak CPA's attribution into the model's context. Other system
+// content is preserved.
+func stripDefaultKimiClaudeCodeAttribution(auth *cliproxyauth.Auth, endpoint string, cliFingerprint bool, body []byte) []byte {
+	if cliFingerprint || !isKimiMessagesUpstream(auth, endpoint) {
+		return body
+	}
+	return util.StripClaudeCodeAttributionSystem(body)
+}
+
+func stripDefaultKimiClaudeCodeAttributionDoc(auth *cliproxyauth.Auth, endpoint string, cliFingerprint bool, doc *ojson.Doc) bool {
+	if cliFingerprint || !isKimiMessagesUpstream(auth, endpoint) {
+		return false
+	}
+	return stripClaudeCodeAttributionSystemDoc(doc)
+}
+
+func stripClaudeCodeAttributionSystemDoc(doc *ojson.Doc) bool {
+	if doc == nil {
+		return false
+	}
+	system := doc.Get("system")
+	if !system.Exists() {
+		return false
+	}
+	if system.Type == ojson.String {
+		if !util.IsClaudeCodeAttributionSystemText(system.String()) {
+			return false
+		}
+		return doc.Delete("system") == nil
+	}
+	if !system.IsArray() {
+		return false
+	}
+	kept := make([]string, 0, len(system.Array()))
+	removed := false
+	system.ForEach(func(_, block ojson.Result) bool {
+		if block.Get("type").String() == "text" && util.IsClaudeCodeAttributionSystemText(block.Get("text").String()) {
+			removed = true
+			return true
+		}
+		if block.Raw != "" {
+			kept = append(kept, block.Raw)
+		}
+		return true
+	})
+	if !removed {
+		return false
+	}
+	if len(kept) == 0 {
+		return doc.Delete("system") == nil
+	}
+	return doc.SetRawBytes("system", []byte("["+strings.Join(kept, ",")+"]")) == nil
+}
+
+// claudeCCHSigningEnabled applies CPA's CCH policy.
+//
+// Native gate, identical in Claude Code 2.1.220 through 2.1.234:
+//
+//	s = (provider === "firstParty" && isFirstPartyBaseURL()) || provider === "vertex"
+//	      ? " cch=00000;" : ""
+//
+// where isFirstPartyBaseURL() is true when ANTHROPIC_BASE_URL is unset or its
+// host is api.anthropic.com. Every other backend (bedrock, foundry, mantle,
+// anthropicAws, anthropicGoogleCloud, gateway, any custom base URL) sends the
+// billing header without cch.
+//
+// CPA maps that onto two authorities:
+//
+//   - A real Claude OAuth credential always signs, on every upstream. CPA is the
+//     hop that restores the first-party shape: a downstream Claude Code pointed at
+//     CPA sees a non-first-party base URL and therefore omits cch itself, so the
+//     value has to be regenerated here rather than inherited.
+//   - An API key or delegated provider signs only when it explicitly opted into
+//     the claude-code-cli profile AND the upstream is one the native gate accepts.
+//     On any other gateway the billing header still goes out, but without cch, so
+//     a per-request hash cannot bust that gateway's prompt cache.
+//
+// origin is the concrete upstream URL of the request being built. CPA additionally
+// requires https and the default port, which native does not check.
+func claudeCCHSigningEnabled(apiKey string, kind claudeCCHUpstreamKind, cliFingerprint bool, origin string) bool {
 	if isClaudeOAuthToken(apiKey) {
 		return true
 	}
 	if kind == claudeCCHUpstreamVertex {
 		return true
 	}
-	if kind != claudeCCHUpstreamAnthropic {
+	if !cliFingerprint {
 		return false
 	}
-
-	parsed, err := url.Parse(strings.TrimSpace(endpoint))
-	if err != nil || parsed.User != nil || !strings.EqualFold(parsed.Scheme, "https") {
-		return false
-	}
-	if !strings.EqualFold(parsed.Hostname(), "api.anthropic.com") {
-		return false
-	}
-	if port := parsed.Port(); port != "" && port != "443" {
-		return false
-	}
-	return strings.Contains(parsed.EscapedPath(), "/v1/messages")
+	return kind == claudeCCHUpstreamAnthropic && isAnthropicUpstreamBase(origin)
 }
 
 // signAnthropicMessagesBody reproduces Claude Code 2.1.220's final-body CCH.
@@ -182,9 +333,27 @@ func signAnthropicMessagesBody(body []byte) ([]byte, error) {
 	return unsignedBody, nil
 }
 
+func claudeBillingRawHasCCHDigits(rawStr string) bool {
+	raw := []byte(rawStr)
+	for searchFrom := 0; searchFrom < len(raw); {
+		relative := bytes.Index(raw[searchFrom:], []byte("cch="))
+		if relative < 0 {
+			return false
+		}
+		prefix := searchFrom + relative
+		digits := prefix + len("cch=")
+		end := digits + claudeCCHLength
+		if end < len(raw) && raw[end] == ';' && isLowerHex(raw[digits:end]) {
+			return true
+		}
+		searchFrom = prefix + len("cch=")
+	}
+	return false
+}
+
 func claudeBillingCCHDigitsOffset(body []byte) (int, bool) {
-	billing := gjson.GetBytes(body, "system.0.text")
-	if billing.Type != gjson.String || !strings.HasPrefix(billing.String(), "x-anthropic-billing-header:") {
+	billing := ojson.GetBytesNoCopy(body, "system.0.text")
+	if billing.Type != ojson.String || !strings.HasPrefix(billing.String(), "x-anthropic-billing-header:") {
 		return 0, false
 	}
 
@@ -482,6 +651,38 @@ func resolveClaudeKeyConfig(cfg *config.Config, auth *cliproxyauth.Auth) *config
 
 // resolveClaudeKeyCloakConfig finds the matching ClaudeKey config and returns its CloakConfig.
 func resolveClaudeKeyCloakConfig(cfg *config.Config, auth *cliproxyauth.Auth) *config.CloakConfig {
+	if cfg != nil && cfg.Home.Enabled && auth != nil {
+		if mode, strictMode, words, replacements, cacheUserID, ok := claudeauth.ReadMetadataHomeCloak(&auth.Metadata); ok {
+			rawPatterns := claudeauth.ReadMetadataHomeCloakPatterns(&auth.Metadata)
+			var patterns []config.SensitivePatternRule
+			if len(rawPatterns) > 0 {
+				patterns = make([]config.SensitivePatternRule, 0, len(rawPatterns))
+				for _, pair := range rawPatterns {
+					if strings.TrimSpace(pair[0]) == "" {
+						continue
+					}
+					patterns = append(patterns, config.SensitivePatternRule{
+						Pattern:     pair[0],
+						Replacement: pair[1],
+					})
+				}
+			}
+			var normalizedWords []string
+			for _, w := range words {
+				if trimmed := strings.TrimSpace(w); trimmed != "" {
+					normalizedWords = append(normalizedWords, trimmed)
+				}
+			}
+			return &config.CloakConfig{
+				Mode:                     strings.TrimSpace(mode),
+				StrictMode:               strictMode,
+				SensitiveWords:           normalizedWords,
+				SensitiveWordsReplace:    config.NormalizeSensitiveWordsReplace(replacements),
+				SensitivePatternsReplace: patterns,
+				CacheUserID:              cacheUserID,
+			}
+		}
+	}
 	entry := resolveClaudeKeyConfig(cfg, auth)
 	if entry == nil {
 		return nil

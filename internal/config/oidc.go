@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 )
 
 const (
@@ -66,7 +66,7 @@ type OIDCConfig struct {
 	CallbackPath  string `yaml:"callback-path" json:"callback-path"`
 	RedirectURI   string `yaml:"redirect-uri" json:"redirect-uri"`
 	LLMEndpoint   string `yaml:"llm-endpoint" json:"llm-endpoint"`
-	// 参考 https://github.com/router-for-me/CLIProxyAPI/blob/main/docs/sdk-advanced_CN.md
+	// See https://github.com/router-for-me/CLIProxyAPI/blob/main/docs/sdk-advanced_CN.md.
 	RequestFormat  string            `yaml:"request-format" json:"request-format"`
 	ResponseFormat string            `yaml:"response-format" json:"response-format"`
 	Headers        map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`

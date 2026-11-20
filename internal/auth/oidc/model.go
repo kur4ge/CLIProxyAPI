@@ -3,9 +3,9 @@ package oidc
 import (
 	"encoding/json"
 
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 )
 
 func ResolveModels(cfg *config.Config, auth *coreauth.Auth) []config.OIDCModel {
